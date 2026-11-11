@@ -1,0 +1,15 @@
+bootdelay=1
+baudrate=115200
+bootfile="uImage"
+bootargs_512M=mem=512M mmz=ddr,0,0,256M
+bootargs_2G=mem=2G mmz=ddr,0,0,600M
+bootargs_1G=mem=1G mmz=ddr,0,0,380M
+stdin=serial
+stdout=serial
+stderr=serial
+ver=Fastboot 3.3.0-dirty (hjjung@) (Nov 10 2016 - 20:01:39)
+netmask=255.255.255.0
+ipaddr=192.168.1.10
+serverip=192.168.1.38
+bootargs=console=ttyAMA0,115200 earlycon=pl011,mmio32,0xf8b00000 root=/dev/mmcblk0p4 rootwait=20 panic=5 mem=1G clk_ignore_unused blkdevparts=mmcblk0:1M(fastboot),1M(bootargs),32M(kernel),3182M(rootfs),8M(baseparam),20M(logo)
+bootcmd=mmc read 0 0x4000000 0x1000 0x10000; bootm 0x4000000

@@ -1,0 +1,135 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
+/*
+ * Device tree for Hi3798Mv100 "bigfish" reference board
+ *
+ * Board: bigfish (G6O110SVT / HiSTBAndroidV600R001C00SPC062)
+ * SoC:   HiSilicon Hi3798Mv100 (quad Cortex-A7 @ 1.2GHz)
+ * RAM:   1GB DDR3
+ * Boot:  U-Boot Fastboot 3.3.0, kernel loaded at 0x02000000
+ */
+
+/dts-v1/;
+
+#include "hi3798mv100.dtsi"
+
+/ {
+	model = "HiSilicon Hi3798Mv100 Bigfish Board";
+	compatible = "hisilicon,hi3798mv100", "hisilicon,hi3798mv100-bigfish";
+
+	aliases {
+		serial0 = &uart0;
+		serial1 = &uart1;
+		serial2 = &uart2;
+		mmc0 = &mmc0;
+		mmc1 = &mmc1;
+		ethernet0 = &femac;
+	};
+
+	chosen {
+		#address-cells = <1>;
+		#size-cells = <1>;
+		ranges;
+		stdout-path = "serial0:115200n8";
+
+		/*
+		 * HDMI boot framebuffer set up by Fastboot (logo from the 'logo' partition, display
+		 * config from 'baseparam'): VDP HD graphics layer @ f8cc6800 scans out 0x3efd5000,
+		 * 1920x1080 ARGB8888, stride 0x1e0*16 = 7680 (read back from the live registers).
+		 */
+		framebuffer@3efd5000 {
+			compatible = "simple-framebuffer";
+			reg = <0x3efd5000 0x7e9000>;
+			width = <1920>;
+			height = <1080>;
+			stride = <7680>;
+			format = "a8r8g8b8";
+			memory-region = <&vdp_fastboot>;
+		};
+	};
+
+	memory@0 {
+		device_type = "memory";
+		reg = <0x00000000 0x40000000>;
+	};
+
+	reserved-memory {
+		#address-cells = <1>;
+		#size-cells = <1>;
+		ranges;
+
+		/*
+		 * Fastboot "Reserve Memory" area (0x3e357000..0x40000000): HD + SD graphics
+		 * framebuffers, VDP coefficient/parameter tables (VDP regs point at 0x3f7bf000..,
+		 * 0x3fd00000..), all still read by the display engine after handoff.
+		 */
+		vdp_fastboot: framebuffer@3e357000 {
+			reg = <0x3e357000 0x1ca9000>;
+			no-map;
+		};
+	};
+};
+
+&uart0 {
+	status = "okay";
+};
+
+&mmc0 {
+	status = "okay"; /* eMMC @ f9830000 (b30: was pointing at SD controller f9820000 with wrong IRQ) */
+};
+
+&gpu_glue {
+	status = "okay";
+};
+
+&usb3 {
+	status = "okay";
+};
+
+&mmc1 {
+	status = "okay";
+};
+
+&mdio0 {
+	status = "okay";
+};
+
+&femac {
+	status = "okay";
+	local-mac-address = [80 8c 97 42 50 34]; /* U-Boot env ethaddr */
+};
+
+&ehci0 {
+	status = "okay";
+};
+
+&ohci0 {
+	status = "okay";
+};
+
+&ehci1 {
+	status = "okay";
+};
+
+&ohci1 {
+	status = "okay";
+};
+
+&usb_otg {
+	status = "disabled"; /* GSNPSID reads 0x0 — controller absent or ungated on this board */
+};
+
+&i2c0 {
+	status = "disabled";
+};
+
+&i2c1 {
+	status = "disabled";
+};
+
+&i2c2 {
+	status = "disabled";
+};
+
+&ir {
+	status = "okay";
+};

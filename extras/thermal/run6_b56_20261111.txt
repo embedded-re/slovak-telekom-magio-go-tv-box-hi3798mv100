@@ -1,0 +1,5 @@
+run6 2026-11-11, b56, 4-core load good pad + new heatsink
+start 44.8 C -> 59.5 C after 10 s (+15)
+1.2 GHz held 200 s (74.4 C), then 1200/800 cycling to 360 s (peak 78.1 C)
+from 360 s pinned at 800 MHz, still creeping: 75.1 -> 77.9 C at 620 s
++GPU 20 s: 78.5 C, then stopped; 67.4 C a few s after stop

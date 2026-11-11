@@ -1,0 +1,5 @@
+run7 2026-11-11, b56, 4-core load, good pad + new heatsink + fan
+start 41.9 C -> ~56 C after load start (+12..14)
+CPU 10 min: 1.2 GHz all the time, never throttled, flat at ~58.8 C from ~3.5 min
++GPU 5 min (gles2_stress, GPU 200-432 MHz): 1.2 GHz, max 60.2 C, 570/570 frames correct
+cooldown: 60.2 -> 44.0 C in 20 s, ~41-42 C after 60 s

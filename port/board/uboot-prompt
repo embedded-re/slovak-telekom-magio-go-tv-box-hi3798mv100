@@ -1,0 +1,16 @@
+#!/bin/sh
+# Make the NEXT boot stop at the U-Boot "fastboot#" prompt (Fastboot autoboot can't be interrupted).
+# Removes bootcmd from the env; restore later in U-Boot with setenv bootcmd ...; saveenv
+# (the value is saved to /root/bootcmd.saved / printed here).
+set -e
+cur=$(fw_printenv -n bootcmd 2>/dev/null || true)
+[ -n "$cur" ] && echo "$cur" > "${HOME:-/root}/bootcmd.saved" 2>/dev/null || true
+echo "current bootcmd: ${cur:-<none>}"
+fw_setenv bootcmd
+echo "bootcmd removed -- next boot stops at fastboot#. Restore with:"
+echo "  setenv bootcmd '$cur'; saveenv"
+if [ "$1" = "-r" ]; then
+	sync
+	# clean reboot under OpenRC; in the initramfs rescue shell PID 1 is /init, so force it
+	if [ -d /run/openrc ]; then reboot; else reboot -f; fi
+fi

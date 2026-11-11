@@ -1,0 +1,336 @@
+fastboot# fatload usb 0:1 0x4000000 hi_kernel.uImage
+reading hi_kernel.uImage
+...............................................................................................................................................................................................................................................................................................................................................................................................
+7860224 bytes read
+fastboot# fatload usb 0:1 0x4000000 hi_kernel.uImage<INTERRUPT>
+fastboot# fatload usb 0:1 0x8000000 uInitrd.img;
+reading uInitrd.img
+...............
+323625 bytes read
+fastboot# setenv bootargs mem=1G mmz=ddr,0,0,380M console=ttyAMA0,115200 blkdevparts=mmcblk0:1M(fastboot),1M(bootargs),10M(recovery),2M(deviceinfo),8M(baseparam),8M(pqparam),20M(logo),20M(logobak),40M(fastplay),40M(fastplaybak),40M(kernel),20M(misc),8M(userapi),8M(hibdrv),8M(qbflag),300M(qbdata),500M(system),1024M(userdata),400M(cache),-(sdcard) rw;
+fastboot# bootm 0x4000000 0x8000000;
+## Booting kernel from Legacy Image at 04000000 ...
+   Image Name:   Linux-3.10.0_s40
+   Image Type:   ARM Linux Kernel Image (uncompressed)
+   Data Size:    7858984 Bytes = 7.5 MiB
+   Load Address: 02000000
+   Entry Point:  02000000
+   Verifying Checksum ... OK
+## Loading init Ramdisk from Legacy Image at 08000000 ...
+   Image Name:   Alpine-Root-Pivot
+   Image Type:   ARM Linux RAMDisk Image (gzip compressed)
+   Data Size:    323561 Bytes = 316 KiB
+   Load Address: 00000000
+   Entry Point:  00000000
+   Verifying Checksum ... OK
+   Loading Kernel Image ... OK
+OK
+
+Starting kernel ...
+
+Uncompressing Linux... done, booting the kernel.
+[    0.000000] Booting Linux on physical CPU 0x0
+[    0.000000] Linux version 3.10.0_s40 (hjjung@INNO-APP) (gcc version 4.4.1 (Hisilicon_v200(gcc4.4-290+glibc-2.11+eabi+nptl)) ) #9 SMP Thu Apr 6 21:54:40 KST 2017
+[    0.000000] CPU: ARMv7 Processor [410fc075] revision 5 (ARMv7), cr=10c53c7d
+[    0.000000] CPU: PIPT / VIPT nonaliasing data cache, VIPT aliasing instruction cache
+[    0.000000] Machine: bigfish
+[    0.000000] cma: CMA: reserved 380 MiB at 28400000
+[    0.000000] cma: CMA: reserved 4 MiB at 28000000
+[    0.000000] Memory policy: ECC disabled, Data cache writealloc
+[    0.000000] CPU: Hi3798Mv100 
+[    0.000000] PERCPU: Embedded 8 pages/cpu @81aa0000 s12224 r8192 d12352 u32768
+[    0.000000] Built 1 zonelists in Zone order, mobility grouping on.  Total pages: 260096
+[    0.000000] Kernel command line: mem=1G mmz=ddr,0,0,380M console=ttyAMA0,115200 blkdevparts=mmcblk0:1M(fastboot),1M(bootargs),10M(recovery),2M(deviceinfo),8M(baseparam),8M(pqparam),20M(logo),20M(logobak),40M(fastplay),40M(fastplaybak),40M(kernel),20M(misc),8M(userapi),8M(hibdrv),8M(qbflag),300M(qbdata),500M(system),1024M(userdata),400M(cache),-(sdcard) rw
+[    0.000000] PID hash table entries: 4096 (order: 2, 16384 bytes)
+[    0.000000] Dentry cache hash table entries: 131072 (order: 7, 524288 bytes)
+[    0.000000] Inode-cache hash table entries: 65536 (order: 6, 262144 bytes)
+[    0.000000] Memory: 1024MB = 1024MB total
+[    0.000000] Memory: 626072k/626072k available, 422504k reserved, 0K highmem
+[    0.000000] Virtual kernel memory layout:
+[    0.000000]     vector  : 0xffff0000 - 0xffff1000   (   4 kB)
+[    0.000000]     fixmap  : 0xfff00000 - 0xfffe0000   ( 896 kB)
+[    0.000000]     vmalloc : 0xc0800000 - 0xff000000   (1000 MB)
+[    0.000000]     lowmem  : 0x80000000 - 0xc0000000   (1024 MB)
+[    0.000000]     pkmap   : 0x7fe00000 - 0x80000000   (   2 MB)
+[    0.000000]     modules : 0x7f000000 - 0x7fe00000   (  14 MB)
+[    0.000000]       .text : 0x80008000 - 0x80eecf78   (15252 kB)
+[    0.000000]       .init : 0x80eed000 - 0x80f67fc0   ( 492 kB)
+[    0.000000]       .data : 0x80f68000 - 0x810b32a8   (1325 kB)
+[    0.000000]        .bss : 0x810b32a8 - 0x81299e54   (1947 kB)
+[    0.000000] SLUB: HWalign=64, Order=0-3, MinObjects=0, CPUs=4, Nodes=1
+[    0.000000] Hierarchical RCU implementation.
+[    0.000000] NR_IRQS:192
+[    0.000000] sched_clock: 32 bits at 24MHz, resolution 41ns, wraps every 178956ms
+[    0.000000] Console: colour dummy device 80x30
+[    0.000176] Calibrating delay loop... 2383.87 BogoMIPS (lpj=1191936)
+[    0.007039] pid_max: default: 32768 minimum: 301
+[    0.007166] Mount-cache hash table entries: 512
+[    0.007730] CPU: Testing write buffer coherency: ok
+[    0.007776] ftrace: allocating 32764 entries in 97 pages
+[    0.047683] CPU0: thread -1, cpu 0, socket 0, mpidr 80000000
+[    0.047748] Setting up static identity map for 0x80b30298 - 0x80b302f0
+[    0.055718] CPU1: thread -1, cpu 1, socket 0, mpidr 80000001
+[    0.062716] CPU2: thread -1, cpu 2, socket 0, mpidr 80000002
+[    0.069717] CPU3: thread -1, cpu 3, socket 0, mpidr 80000003
+[    0.069785] Brought up 4 CPUs
+[    0.069800] SMP: Total of 4 processors activated (9572.35 BogoMIPS).
+[    0.069805] CPU: All CPU(s) started in SVC mode.
+[    0.263269] [249 ERROR-HI_PQ]:DRV_PQ_GetFlashPqBin[2968]:PQ bin param may not burned
+[    0.263286] [249 ERROR-HI_PQ]:HI_DRV_PQ_Init[245]:Load PQBin failed!
+[    0.297689] [283 ERROR-Invalid]:MCE_Init[2135]:ERR: get PDM Param
+[    0.297931] NET: Registered protocol family 16
+[    0.298958] DMA: preallocated 256 KiB pool for atomic coherent allocations
+[    0.298966] hi3798mx_gpio_init
+[    0.300121] hw-breakpoint: found 5 (+1 reserved) breakpoint and 4 watchpoint registers.
+[    0.300131] hw-breakpoint: maximum watchpoint size is 8 bytes.
+[    0.300243] Serial: AMBA PL011 UART driver
+[    0.300311] uart:0: ttyAMA0 at MMIO 0xf8b00000 (irq = 81) is a PL011 rev2
+[    0.646681] console [ttyAMA0] enabled
+[    0.650548] uart:1: ttyAMA1 at MMIO 0xf8006000 (irq = 82) is a PL011 rev2
+[    0.657524] uart:2: ttyAMA2 at MMIO 0xf8b02000 (irq = 83) is a PL011 rev2
+[    0.705214] bio: create slab <bio-0> at 0
+[    0.710157] SCSI subsystem initialized
+[    0.714385] usbcore: registered new interface driver usbfs
+[    0.720010] usbcore: registered new interface driver hub
+[    0.725448] usbcore: registered new device driver usb
+[    0.730857] Linux video capture interface: v2.00
+[    0.736077] Advanced Linux Sound Architecture Driver Initialized.
+[    0.742836] Bluetooth: Core ver 2.16
+[    0.746511] NET: Registered protocol family 31
+[    0.750976] Bluetooth: HCI device and connection manager initialized
+[    0.757337] Bluetooth: HCI socket layer initialized
+[    0.762218] Bluetooth: L2CAP socket layer initialized
+[    0.767288] Bluetooth: SCO socket layer initialized
+[    0.772504] cfg80211: Calling CRDA to update world regulatory domain
+[    0.779290] Switching to clocksource timer3
+[    0.807569] NET: Registered protocol family 2
+[    0.812395] TCP established hash table entries: 8192 (order: 4, 65536 bytes)
+[    0.819565] TCP bind hash table entries: 8192 (order: 4, 65536 bytes)
+[    0.826103] TCP: Hash tables configured (established 8192 bind 8192)
+[    0.832528] TCP: reno registered
+[    0.835765] UDP hash table entries: 512 (order: 2, 16384 bytes)
+[    0.841719] UDP-Lite hash table entries: 512 (order: 2, 16384 bytes)
+[    0.848262] NET: Registered protocol family 1
+[    0.852843] RPC: Registered named UNIX socket transport module.
+[    0.858771] RPC: Registered udp transport module.
+[    0.863475] RPC: Registered tcp transport module.
+[    0.868178] RPC: Registered tcp NFSv4.1 backchannel transport module.
+[    0.874778] Trying to unpack rootfs image as initramfs...
+[    0.898001] Freeing initrd memory: 312K (88001000 - 8804f000)
+[    0.903936] NetWinder Floating Point Emulator V0.97 (double precision)
+[    0.910531] CPU PMU: probing PMU on CPU 3
+[    0.914557] hw perfevents: enabled with ARMv7 Cortex-A7 PMU driver, 5 counters available
+[    0.922931] Hibernate get drv phyaddr error
+[    0.936693] VFS: Disk quotas dquot_6.5.2
+[    0.940900] Dquot-cache hash table entries: 1024 (order 0, 4096 bytes)
+[    0.949955] squashfs: version 4.0 (2009/01/31) Phillip Lougher
+[    0.957567] jffs2: version 2.2. (NAND) © 2001-2006 Red Hat, Inc.
+[    0.964136] fuse init (API version 7.22)
+[    0.968824] msgmni has been set to 1991
+[    0.974009] Block layer SCSI generic (bsg) driver version 0.4 loaded (major 253)
+[    0.981412] io scheduler noop registered
+[    0.985340] io scheduler deadline registered (default)
+[    0.990495] io scheduler cfq registered
+[    1.001627] brd: module loaded
+[    1.008152] loop: module loaded
+[    1.012052] input: Hi keyboard as /devices/virtual/input/input0
+[    1.018189] input: Hi mouse as /devices/virtual/input/input1
+[    1.024079] input: qwerty as /devices/virtual/input/input2
+[    1.029573] Hi Android vinput driver init successful!
+[    1.035600] Found Nand Flash Controller V610.
+[    1.040267] Nand ID: 0x00 0x00 0x00 0x00 0x00 0x00 0x00 0x00
+[    1.045945] No NAND device found
+[    1.049209] tun: Universal TUN/TAP device driver, 1.6
+[    1.054260] tun: (C) 1999-2004 Max Krasnyansky <maxk@qualcomm.com>
+[    1.278994] libphy: himii: probed
+[    2.046331] Up port phy at 0x01 is connect
+[    2.073549] libphy: PHY himii:1f not found
+[    2.079956] PPP generic driver version 2.4.2
+[    2.084469] PPP BSD Compression module registered
+[    2.089187] PPP Deflate Compression module registered
+[    2.094252] PPP MPPE Compression module registered
+[    2.099048] NET: Registered protocol family 24
+[    2.103706] usbcore: registered new interface driver r8152
+[    2.109331] usbcore: registered new interface driver smsc75xx
+[    2.115217] usbcore: registered new interface driver smsc95xx
+[    2.121084] usbotg: usb otg driver registered[    2.121199] usbcore: registered new interface driver cdc_wdm
+[    2.121321] usbcore: registered new interface driver usb-storage
+[    2.121574] usbcore: registered new interface driver usbserial
+[    2.121685] usbcore: registered new interface driver option
+[    2.121795] usbserial: USB Serial support registered for GSM modem (1-port)
+[    2.121864] dwc_otg: version 3.00a 10-AUG-2012
+[    2.161636] Core Release: 3.10a
+[    2.164789] Setting default values for core params
+[    2.371528] Using Buffer DMA mode
+[    2.374877] Dedicated Tx FIFOs mode
+[    2.378933] g_ffs: file system registered
+[    2.383582] mousedev: PS/2 mouse device common for all mice
+[    2.390227] usbcore: registered new interface driver uvcvideo
+[    2.396010] USB Video Class driver (1.1.1)
+[    2.400539] device-mapper: ioctl: 4.24.0-ioctl (2013-01-15) initialised: dm-devel@redhat.com
+[    2.409210] Bluetooth: HCI UART driver ver 2.2
+[    2.413709] Bluetooth: HCI H4 protocol initialized
+[    2.418513] Bluetooth: HCI BCSP protocol initialized
+[    2.423477] Bluetooth: HCILL protocol initialized
+[    2.428180] Bluetooth: HCIATH3K protocol initialized
+[    2.433146] Bluetooth: HCI Three-wire UART (H5) protocol initialized
+[    2.439645] usbcore: registered new interface driver bcm203x
+[    2.769196] mmc0: BKOPS_EN bit is not set
+[    2.774695] mmc0: new high speed DDR MMC card at address 0001
+[    2.780878] mmcblk0: mmc0:0001 4FPD3R 3.64 GiB 
+[    2.785531] mmcblk0boot0: mmc0:0001 4FPD3R partition 1 4.00 MiB
+[    2.791579] mmcblk0boot1: mmc0:0001 4FPD3R partition 2 4.00 MiB
+[    2.797979]  mmcblk0: p1(fastboot) p2(bootargs) p3(recovery) p4(deviceinfo) p5(baseparam) p6(pqparam) p7(logo) p8(logobak) p9(fastplay) p10(fastplaybak) p11(kernel) p12(misc) p13(userapi) p14(hibdrv) p15(qbflag) p16(qbdata) p17(system) p18(userdata) p19(cache) p20(sdcard)
+[    2.827071]  mmcblk0boot1: unknown partition table
+[    2.832759]  mmcblk0boot0: unknown partition table
+[    2.915907] hidraw: raw HID events driver (C) Jiri Kosina
+[    2.929058] usbcore: registered new interface driver usbhid
+[    2.934646] usbhid: USB HID core driver
+[    2.939012] zram: Created 1 device(s) ...
+[    2.943963] ashmem: initialized
+[    2.947293] logger: created 256K log 'log_main'
+[    2.952001] logger: created 256K log 'log_events'
+[    2.956889] logger: created 256K log 'log_radio'
+[    2.961678] logger: created 256K log 'log_system'
+
+[    2.971027] Mali: Mali device driver loaded
+[    2.975906] usbcore: registered new interface driver snd-usb-audio
+[    2.983007] oprofile: using timer interrupt.
+[    2.987372] Netfilter messages via NETLINK v0.30.
+[    2.992150] nf_conntrack version 0.5.0 (15931 buckets, 63724 max)
+[    2.998944] ctnetlink v0.93: registering with nfnetlink.
+[    3.004365] NF_TPROXY: Transparent proxy support initialized, version 4.1.0
+[    3.011327] NF_TPROXY: Copyright (c) 2006-2007 BalaBit IT Ltd.
+[    3.017706] xt_time: kernel timezone is -0000
+[    3.022082] IPVS: Registered protocols ()
+[    3.026122] IPVS: Connection hash table configured (size=4096, memory=32Kbytes)
+[    3.033560] IPVS: Creating netns size=776 id=0
+[    3.038061] IPVS: ipvs loaded.
+[    3.041357] ip_tables: (C) 2000-2006 Netfilter Core Team
+[    3.046777] ipt_CLUSTERIP: ClusterIP Version 0.8 loaded successfully
+[    3.053188] arp_tables: (C) 2002 David S. Miller
+[    3.057856] TCP: cubic registered
+[    3.061955] NET: Registered protocol family 10
+[    3.067024] ip6_tables: (C) 2000-2006 Netfilter Core Team
+[    3.072633] NET: Registered protocol family 17
+[    3.077203] Bluetooth: RFCOMM TTY layer initialized
+[    3.082119] Bluetooth: RFCOMM socket layer initialized
+[    3.087266] Bluetooth: RFCOMM ver 1.11
+[    3.091030] Bluetooth: BNEP (Ethernet Emulation) ver 1.3
+[    3.096347] Bluetooth: BNEP filters: protocol multicast
+[    3.101586] Bluetooth: BNEP socket layer initialized
+[    3.106558] Bluetooth: HIDP (Human Interface Emulation) ver 1.2
+[    3.112496] Bluetooth: HIDP socket layer initialized
+[    3.117471] lib80211: common routines for IEEE802.11 drivers
+[    3.123321] VFP support v0.3: implementor 41 architecture 2 part 30 variant 7 rev 5
+[    3.136002] Load hi_tde.ko success.		(SDK_VERSION:[HiSTBAndroidV600R001C00SPC062_v2015072619] Build Time:[Mar 21 2017, 20:43:14])
+[    3.155160] Load hi_fb.ko success.	(SDK_VERSION:[HiSTBAndroidV600R001C00SPC062_v2015072619] Build Time:[Mar 21 2017, 20:42:54])
+[    3.171077] DieID is locked!
+[    3.179738] hisi-sndcard hisi-sndcard:  aiao-hifi <-> hisi-i2s mapping ok
+[    3.191290] Load hi_png.ko success.		(SDK_VERSION:[HiSTBAndroidV600R001C00SPC062_v2015072619] Build Time:[Mar 21 2017, 20:42:52])
+[    3.203430] Load hi_jpegenc.ko success.	(SDK_VERSION:[HiSTBAndroidV600R001C00SPC062_v2015072619] Build Time:[Mar 21 2017, 20:42:52])
+[    3.227080] enter temperature_control_thread
+[    3.232085] ALSA device list:
+[    3.235062]   #0: HISI-AIAO
+[    3.238284] Freeing unused kernel memory: 488K (80eed000 - 80f67000)
+[    4.070895] init: /init.bigfish.rc: 69: invalid option 'sdcard_r'
+[    4.077703] init:  not 512M version
+[    4.081576] init (1): /proc/1/oom_adj is deprecated, please use /proc/1/oom_score_adj instead.
+[    4.172478] init: /dev/hw_random not found
+[    4.176938] init: cannot open '/initlogo.rle'
+[    4.188215] EXT4-fs (mmcblk0p17): mounted filesystem with ordered data mode. Opts: (null)
+[    4.245876] EXT4-fs (mmcblk0p18): recovery complete
+[    4.251317] EXT4-fs (mmcblk0p18): mounted filesystem with ordered data mode. Opts: (null)
+[    4.268364] EXT4-fs (mmcblk0p19): recovery complete
+[    4.273797] EXT4-fs (mmcblk0p19): mounted filesystem with ordered data mode. Opts: (null)
+[    8.223547] mmc1: error -110 whilst initialising SD card
+[    8.405396] init: /dev/hw_random not found
+[    8.434401] healthd: No charger supplies found
+[    8.437381] init: cannot find '/system/bin/rild', disabling 'ril-daemon'
+[    8.439058] init: cannot find '/system/bin/dbus-daemon', disabling 'dbus'
+[    8.448625] init: cannot find '/system/etc/install-recovery.sh', disabling 'flash_recovery'
+[    8.449097] init: cannot find '/system/bin/mtkbt', disabling 'blueangel'
+[    8.451541] init: cannot find '/system/bin/dtvserver', disabling 'dtvserver'
+[    8.451587] init: cannot find '/system/bin/gpio-led', disabling 'gpio-led'
+[    8.451610] init: cannot find '/system/bin/hidns-sd', disabling 'hidns-sd'
+[    8.451631] init: cannot find '/system/bin/usb-driver', disabling 'usb-driver'
+[    8.454821] init: property 'sys.powerctl' doesn't exist while expanding '${sys.powerctl}'
+[    8.454830] init: powerctl: cannot expand '${sys.powerctl}'
+[    8.454843] init: property 'sys.sysctl.extra_free_kbytes' doesn't exist while expanding '${sys.sysctl.extra_free_kbytes}'
+[    8.454849] init: cannot expand '${sys.sysctl.extra_free_kbytes}' while writing to '/proc/sys/vm/extra_free_kbytes'
+[    8.457934] g_ffs: read descriptors
+[    8.457946] g_ffs: read strings
+[    8.458045] g_ffs gadget: g_ffs ready
+[    8.540826] healthd: BatteryStatusPath not found
+[    8.546102] healthd: BatteryHealthPath not found
+[    8.550767] healthd: BatteryPresentPath not found
+[    8.555553] healthd: BatteryCapacityPath not found
+[    8.560793] healthd: BatteryVoltagePath not found
+[    8.565533] healthd: BatteryTemperaturePath not found
+[    8.570600] healthd: BatteryTechnologyPath not found
+root@G6O110SVT:/ # ************ ADB Enabled **********
+[    8.703861] ehci_hcd: USB 2.0 'Enhanced' Host Controller (EHCI) Driver
+[    8.708487] 
+[    8.708487] 
+[    8.708487] Welcome to HiAndroid
+[    8.708487] 
+[    8.708487] 
+[    8.719673] hiusb-ehci hiusb-ehci.0: HIUSB EHCI
+[    8.724251] hiusb-ehci hiusb-ehci.0: new USB bus registered, assigned bus number 1
+[    8.733862] hiusb-ehci hiusb-ehci.0: irq 98, io mem 0xf9890000
+[    8.745574] hiusb-ehci hiusb-ehci.0: USB 0.0 started, EHCI 1.00
+[    8.753750] hub 1-0:1.0: USB hub found
+[    8.757846] hub 1-0:1.0: 2 ports detected
+[    8.778954] hiusb-ehci hiusb-ehci.1: HIUSB EHCI
+[    8.783555] hiusb-ehci hiusb-ehci.1: new USB bus registered, assigned bus number 2
+[    8.798054] hiusb-ehci hiusb-ehci.1: irq 94, io mem 0xf9930000
+[    8.809558] hiusb-ehci hiusb-ehci.1: USB 0.0 started, EHCI 1.00
+[    8.829782] hub 2-0:1.0: USB hub found
+[    8.833642] hub 2-0:1.0: 1 port detected
+[    8.850344] ohci_hcd: USB 1.1 'Open' Host Controller (OHCI) Driver
+[    8.865174] hiusb-ohci hiusb-ohci.0: HIUSB OHCI
+[    8.865203] hiusb-ohci hiusb-ohci.0: new USB bus registered, assigned bus number 3
+[    8.865247] hiusb-ohci hiusb-ohci.0: irq 99, io mem 0xf9880000
+[    8.923898] hub 3-0:1.0: USB hub found
+[    8.927769] hub 3-0:1.0: 2 ports detected
+[    8.932376] hiusb-ohci hiusb-ohci.1: HIUSB OHCI
+[    8.937004] hiusb-ohci hiusb-ohci.1: new USB bus registered, assigned bus number 4
+[    8.944687] hiusb-ohci hiusb-ohci.1: irq 95, io mem 0xf9920000
+[    9.007036] hub 4-0:1.0: USB hub found
+[    9.010895] hub 4-0:1.0: 1 port detected
+[    9.063638] usb 1-1: new high-speed USB device number 2 using hiusb-ehci
+[    9.187774] usb-storage 1-1:1.0: USB Mass Storage device detected
+[    9.194578] scsi0 : usb-storage 1-1:1.0
+[    9.301611] usb 1-2: new high-speed USB device number 3 using hiusb-ehci
+[    9.467588] hiusb-xhci hiusb-xhci.0: xHCI Host Controller
+[    9.473087] hiusb-xhci hiusb-xhci.0: new USB bus registered, assigned bus number 5
+[    9.484585] hiusb-xhci hiusb-xhci.0: irq 101, io mem 0xf98a0000
+[    9.491874] hub 5-0:1.0: USB hub found
+[    9.495734] hub 5-0:1.0: 1 port detected
+[    9.500042] hiusb-xhci hiusb-xhci.0: xHCI Host Controller
+[    9.505545] hiusb-xhci hiusb-xhci.0: new USB bus registered, assigned bus number 6
+[    9.514622] hub 6-0:1.0: USB hub found
+[    9.518498] hub 6-0:1.0: 1 port detected
+[    9.542952] tntfs: module license 'Commercial. For support email ntfs-support@tuxera.com.' taints kernel.
+[    9.552568] Disabling lock debugging due to kernel taint
+[    9.562914] Tuxera NTFS driver 3015.1.29.1.1 [Flags: R/W MODULE].
+[   10.152128] input: inno touch rcu as /devices/virtual/input/input3
+[   10.201497] scsi 0:0:0:0: Direct-Access     SanDisk  Cruzer Edge      1.26 PQ: 0 ANSI: 5
+[   10.233589] sd 0:0:0:0: [sda] 15633408 512-byte logical blocks: (8.00 GB/7.45 GiB)
+[   10.242807] sd 0:0:0:0: [sda] Write Protect is off
+[   10.248944] sd 0:0:0:0: [sda] Write cache: disabled, read cache: enabled, doesn't support DPO or FUA
+[   10.265840]  sda: sda1 sda2
+[   10.273318] sd 0:0:0:0: [sda] Attached SCSI removable disk
+[   14.751781] warning: `zygote' uses 32-bit capabilities (legacy support in use)
+[   16.493971] lowmemorykiller: lowmem_shrink: convert oom_adj to oom_score_adj:
+[   16.501130] lowmemorykiller: oom_adj 0 => oom_score_adj 0
+[   16.506551] lowmemorykiller: oom_adj 1 => oom_score_adj 58
+[   16.512043] lowmemorykiller: oom_adj 2 => oom_score_adj 117
+[   16.517620] lowmemorykiller: oom_adj 3 => oom_score_adj 176
+[   16.523199] lowmemorykiller: oom_adj 9 => oom_score_adj 529
+[   16.528772] lowmemorykiller: oom_adj 15 => oom_score_adj 1000
+[   16.756304] IPv6: ADDRCONF(NETDEV_UP): eth0: link is not ready
+[   17.117810] EXT4-fs (mmcblk0p20): recovery complete
+[   17.122747] EXT4-fs (mmcblk0p20): mounted filesystem with ordered data mode. Opts: share
+[   17.147869] FAT-fs (sda1): Volume was not properly unmounted. Some data may be corrupt. Please run fsck.
+[   17.166793] EXT4-fs (sda2): Couldn't mount because of unsupported optional features (2000)

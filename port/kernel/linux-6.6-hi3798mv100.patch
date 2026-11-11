@@ -1,0 +1,2600 @@
+diff --git a/arch/arm/boot/dts/hisilicon/Makefile b/arch/arm/boot/dts/hisilicon/Makefile
+index 5ce0512c0..96df65554 100644
+--- a/arch/arm/boot/dts/hisilicon/Makefile
++++ b/arch/arm/boot/dts/hisilicon/Makefile
+@@ -6,7 +6,8 @@ dtb-$(CONFIG_ARCH_HIP01) += \
+ dtb-$(CONFIG_ARCH_HIP04) += \
+ 	hip04-d01.dtb
+ dtb-$(CONFIG_ARCH_HISI) += \
+-	hi3519-demb.dtb
++	hi3519-demb.dtb \
++	hi3798mv100-bigfish.dtb
+ dtb-$(CONFIG_ARCH_HIX5HD2) += \
+ 	hisi-x5hd2-dkb.dtb
+ dtb-$(CONFIG_ARCH_SD5203) += \
+diff --git a/arch/arm/mach-hisi/platsmp.c b/arch/arm/mach-hisi/platsmp.c
+index 9ce93e0b6..dbd6f0015 100644
+--- a/arch/arm/mach-hisi/platsmp.c
++++ b/arch/arm/mach-hisi/platsmp.c
+@@ -10,6 +10,7 @@
+ #include <linux/delay.h>
+ 
+ #include <asm/cacheflush.h>
++#include <asm/cp15.h>
+ #include <asm/smp_plat.h>
+ #include <asm/smp_scu.h>
+ #include <asm/mach/map.h>
+@@ -182,6 +183,127 @@ static const struct smp_operations hip01_smp_ops __initconst = {
+ 	.smp_boot_secondary     = hip01_boot_secondary,
+ };
+ 
++/*
++ * Hi3798MV100: secondaries reset to 0xffff0000 (on-chip RAM). Their resets live
++ * in PERI_CRG20 (CRG 0xf8a22000 + 0x50): ARM_POR_SRST bit 12+cpu, ARM_SRST
++ * bit 16+cpu, CLUSTER_DBG_SRST bit 20+cpu. The vendor kernel (HiSTB SDK
++ * mach-hi3798mx/platsmp.c) drops the CPU clock to 400 MHz via CRG + 0x48
++ * (CPU_LP, bit 10 = switch begin) while releasing them.
++ */
++#define HI3798MV100_CPU_LP		0x00
++#define HI3798MV100_CPU_LP_SW_BEGIN	BIT(10)
++#define HI3798MV100_CPU_RST		0x08
++#define HI3798MV100_ARM_POR_SRST(c)	BIT(12 + (c))
++#define HI3798MV100_ARM_SRST(c)		BIT(16 + (c))
++#define HI3798MV100_DBG_SRST(c)		BIT(20 + (c))
++
++static void __iomem *hi3798mv100_cpuctrl;
++
++/*
++ * CPU clock cap. U-Boot leaves the CPU at 1.2 GHz (CPU_LP sel 5). Without the
++ * vendor's temperature-control/DVFS thread, sustained 4-core load at 1.2 GHz
++ * silently hard-hangs this box after 2.5-7 min (thermal; worse with more
++ * voltage). 800 MHz (sel 1) passed a 20 min full-load soak. The DT property
++ * "hisilicon,cpu-clk-sel" on the cpuctrl node selects the mux input:
++ * 0 APLL, 1 800 MHz, 3 1.5 GHz, 4 24 MHz, 5 1.2 GHz, 6 400 MHz, 7 600 MHz.
++ * Switch sequence as in U-Boot: write sel|0x300, then sel|0x700.
++ */
++static void __init hi3798mv100_cpu_clk_cap(struct device_node *np)
++{
++	void __iomem *lp = hi3798mv100_cpuctrl + HI3798MV100_CPU_LP;
++	u32 sel, old;
++
++	if (of_property_read_u32(np, "hisilicon,cpu-clk-sel", &sel) || sel > 7)
++		return;
++	old = readl_relaxed(lp);
++	if ((old & 0x7) == sel)
++		return;
++	writel_relaxed(0x300 | sel, lp);
++	writel_relaxed(0x700 | sel, lp);
++	pr_info("hi3798mv100: CPU clock select %u -> %u\n", old & 0x7, sel);
++}
++
++static void __init hi3798mv100_smp_prepare_cpus(unsigned int max_cpus)
++{
++	struct device_node *np;
++
++	np = of_find_compatible_node(NULL, NULL, "hisilicon,hi3798mv100-cpuctrl");
++	if (!np) {
++		pr_err("hi3798mv100: no cpuctrl node, SMP disabled\n");
++		return;
++	}
++	hi3798mv100_cpuctrl = of_iomap(np, 0);
++	if (hi3798mv100_cpuctrl)
++		hi3798mv100_cpu_clk_cap(np);
++	else
++		pr_err("hi3798mv100: failed to map cpuctrl\n");
++	of_node_put(np);
++}
++
++static void hi3798mv100_cpu_reset(unsigned int cpu, bool release)
++{
++	void __iomem *rst = hi3798mv100_cpuctrl + HI3798MV100_CPU_RST;
++	static const u32 order_rel[] = { 0, 2, 1 };	/* POR, DBG, ARM */
++	u32 bits[3] = { HI3798MV100_ARM_POR_SRST(cpu), HI3798MV100_ARM_SRST(cpu),
++			HI3798MV100_DBG_SRST(cpu) };
++	int i;
++
++	for (i = 0; i < 3; i++) {
++		u32 b = release ? bits[order_rel[i]] : bits[order_rel[2 - i]];
++		u32 v = readl_relaxed(rst);
++
++		writel_relaxed(release ? v & ~b : v | b, rst);
++	}
++}
++
++static int hi3798mv100_boot_secondary(unsigned int cpu, struct task_struct *idle)
++{
++	if (!hi3798mv100_cpuctrl)
++		return -ENODEV;
++
++	hix5hd2_set_scu_boot_addr(HIX5HD2_BOOT_ADDRESS,
++				  __pa_symbol(secondary_startup));
++	/* make the trampoline visible to the core coming out of reset */
++	flush_cache_all();
++
++	/*
++	 * The vendor kernel drops the CPU clock to 400 MHz (CPU_LP 0x306/0x706)
++	 * around this; doing so here breaks hisi-femac RX (300+ ms latency,
++	 * drops) until the next reset, so the cores are released at full speed.
++	 */
++	hi3798mv100_cpu_reset(cpu_logical_map(cpu), true);
++
++	arch_send_wakeup_ipi_mask(cpumask_of(cpu));
++	return 0;
++}
++
++#ifdef CONFIG_HOTPLUG_CPU
++static void hi3798mv100_cpu_die(unsigned int cpu)
++{
++	/* leave coherency; cpu_kill() on another CPU then asserts our resets */
++	v7_exit_coherency_flush(louis);
++	while (1)
++		wfi();
++}
++
++static int hi3798mv100_cpu_kill(unsigned int cpu)
++{
++	msleep(10);	/* let the dying CPU reach WFI */
++	hi3798mv100_cpu_reset(cpu_logical_map(cpu), false);
++	return 1;
++}
++#endif
++
++static const struct smp_operations hi3798mv100_smp_ops __initconst = {
++	.smp_prepare_cpus	= hi3798mv100_smp_prepare_cpus,
++	.smp_boot_secondary	= hi3798mv100_boot_secondary,
++#ifdef CONFIG_HOTPLUG_CPU
++	.cpu_die		= hi3798mv100_cpu_die,
++	.cpu_kill		= hi3798mv100_cpu_kill,
++#endif
++};
++
+ CPU_METHOD_OF_DECLARE(hi3xxx_smp, "hisilicon,hi3620-smp", &hi3xxx_smp_ops);
+ CPU_METHOD_OF_DECLARE(hix5hd2_smp, "hisilicon,hix5hd2-smp", &hix5hd2_smp_ops);
+ CPU_METHOD_OF_DECLARE(hip01_smp, "hisilicon,hip01-smp", &hip01_smp_ops);
++CPU_METHOD_OF_DECLARE(hi3798mv100_smp, "hisilicon,hi3798mv100-smp", &hi3798mv100_smp_ops);
+diff --git a/block/partitions/cmdline.c b/block/partitions/cmdline.c
+index c03bc105e..40526497e 100644
+--- a/block/partitions/cmdline.c
++++ b/block/partitions/cmdline.c
+@@ -81,7 +81,7 @@ static int parse_subpart(struct cmdline_subpart **subpart, char *partdef)
+ 
+ 		length = min_t(int, next - partdef,
+ 			       sizeof(new_subpart->name) - 1);
+-		strscpy(new_subpart->name, partdef, length);
++		strscpy(new_subpart->name, partdef, length + 1);
+ 
+ 		partdef = ++next;
+ 	} else
+@@ -139,7 +139,7 @@ static int parse_parts(struct cmdline_parts **parts, const char *bdevdef)
+ 	}
+ 
+ 	length = min_t(int, next - bdevdef, sizeof(newparts->name) - 1);
+-	strscpy(newparts->name, bdevdef, length);
++	strscpy(newparts->name, bdevdef, length + 1);
+ 	newparts->nr_subparts = 0;
+ 
+ 	next_subpart = &newparts->subpart;
+@@ -151,7 +151,7 @@ static int parse_parts(struct cmdline_parts **parts, const char *bdevdef)
+ 		length = (!next) ? (sizeof(buf) - 1) :
+ 			min_t(int, next - bdevdef, sizeof(buf) - 1);
+ 
+-		strscpy(buf, bdevdef, length);
++		strscpy(buf, bdevdef, length + 1);
+ 
+ 		ret = parse_subpart(next_subpart, buf);
+ 		if (ret)
+diff --git a/drivers/clocksource/Kconfig b/drivers/clocksource/Kconfig
+index 0ba0dc4ec..c0a09265b 100644
+--- a/drivers/clocksource/Kconfig
++++ b/drivers/clocksource/Kconfig
+@@ -389,6 +389,15 @@ config ARM_GT_INITIAL_PRESCALER_VAL
+ 	  increase wrt the initial clock value.
+ 	  This affects CPU_FREQ max delta from the initial frequency.
+ 
++config HI3798MV100_TIMER
++	bool "HiSilicon Hi3798MV100 SP804-based clocksource and per-CPU timers"
++	depends on ARM && OF
++	select TIMER_OF
++	select CLKSRC_MMIO
++	help
++	  Clocksource plus one SP804 channel per CPU as local clockevents
++	  on the HiSilicon Hi3798MV100, which has no usable generic timer.
++
+ config ARM_TIMER_SP804
+ 	bool "Support for Dual Timer SP804 module" if COMPILE_TEST
+ 	depends on GENERIC_SCHED_CLOCK && HAVE_CLK
+diff --git a/drivers/clocksource/Makefile b/drivers/clocksource/Makefile
+index 368c3461d..d01256a09 100644
+--- a/drivers/clocksource/Makefile
++++ b/drivers/clocksource/Makefile
+@@ -89,3 +89,4 @@ obj-$(CONFIG_MSC313E_TIMER)		+= timer-msc313e.o
+ obj-$(CONFIG_GOLDFISH_TIMER)		+= timer-goldfish.o
+ obj-$(CONFIG_GXP_TIMER)			+= timer-gxp.o
+ obj-$(CONFIG_CLKSRC_LOONGSON1_PWM)	+= timer-loongson1-pwm.o
++obj-$(CONFIG_HI3798MV100_TIMER)	+= timer-hi3798mv100.o
+diff --git a/drivers/cpufreq/Kconfig.arm b/drivers/cpufreq/Kconfig.arm
+index 123b4bbfc..f1dbe2520 100644
+--- a/drivers/cpufreq/Kconfig.arm
++++ b/drivers/cpufreq/Kconfig.arm
+@@ -181,6 +181,13 @@ config ARM_QCOM_CPUFREQ_HW
+ 	  The driver implements the cpufreq interface for this HW engine.
+ 	  Say Y if you want to support CPUFreq HW.
+ 
++config ARM_HI3798MV100_CPUFREQ
++	tristate "Hi3798MV100 CPU frequency driver"
++	depends on ARCH_HISI || COMPILE_TEST
++	help
++	  CPU frequency switching (800 / 1200 MHz) via the CPU_LP mux of
++	  the Hi3798MV100 SoC.
++
+ config ARM_RASPBERRYPI_CPUFREQ
+ 	tristate "Raspberry Pi cpufreq support"
+ 	depends on CLK_RASPBERRYPI || COMPILE_TEST
+diff --git a/drivers/cpufreq/Makefile b/drivers/cpufreq/Makefile
+index ef8510774..5f29e9a66 100644
+--- a/drivers/cpufreq/Makefile
++++ b/drivers/cpufreq/Makefile
+@@ -70,6 +70,7 @@ obj-$(CONFIG_ARM_PXA2xx_CPUFREQ)	+= pxa2xx-cpufreq.o
+ obj-$(CONFIG_PXA3xx)			+= pxa3xx-cpufreq.o
+ obj-$(CONFIG_ARM_QCOM_CPUFREQ_HW)	+= qcom-cpufreq-hw.o
+ obj-$(CONFIG_ARM_QCOM_CPUFREQ_NVMEM)	+= qcom-cpufreq-nvmem.o
++obj-$(CONFIG_ARM_HI3798MV100_CPUFREQ)	+= hi3798mv100-cpufreq.o
+ obj-$(CONFIG_ARM_RASPBERRYPI_CPUFREQ) 	+= raspberrypi-cpufreq.o
+ obj-$(CONFIG_ARM_S3C64XX_CPUFREQ)	+= s3c64xx-cpufreq.o
+ obj-$(CONFIG_ARM_S5PV210_CPUFREQ)	+= s5pv210-cpufreq.o
+diff --git a/drivers/gpu/drm/lima/lima_bcast.c b/drivers/gpu/drm/lima/lima_bcast.c
+index fbc43f243..6d000504e 100644
+--- a/drivers/gpu/drm/lima/lima_bcast.c
++++ b/drivers/gpu/drm/lima/lima_bcast.c
+@@ -43,6 +43,18 @@ void lima_bcast_suspend(struct lima_ip *ip)
+ 
+ }
+ 
++int lima_bcast_mask_irq(struct lima_ip *ip)
++{
++	bcast_write(LIMA_BCAST_BROADCAST_MASK, 0);
++	bcast_write(LIMA_BCAST_INTERRUPT_MASK, 0);
++	return 0;
++}
++
++int lima_bcast_reset(struct lima_ip *ip)
++{
++	return lima_bcast_hw_init(ip);
++}
++
+ int lima_bcast_init(struct lima_ip *ip)
+ {
+ 	int i;
+diff --git a/drivers/gpu/drm/lima/lima_bcast.h b/drivers/gpu/drm/lima/lima_bcast.h
+index 465ee587b..cd08841e4 100644
+--- a/drivers/gpu/drm/lima/lima_bcast.h
++++ b/drivers/gpu/drm/lima/lima_bcast.h
+@@ -13,4 +13,7 @@ void lima_bcast_fini(struct lima_ip *ip);
+ 
+ void lima_bcast_enable(struct lima_device *dev, int num_pp);
+ 
++int lima_bcast_mask_irq(struct lima_ip *ip);
++int lima_bcast_reset(struct lima_ip *ip);
++
+ #endif
+diff --git a/drivers/gpu/drm/lima/lima_gp.c b/drivers/gpu/drm/lima/lima_gp.c
+index 8dd501b7a..3282997a0 100644
+--- a/drivers/gpu/drm/lima/lima_gp.c
++++ b/drivers/gpu/drm/lima/lima_gp.c
+@@ -34,11 +34,11 @@ static irqreturn_t lima_gp_irq_handler(int irq, void *data)
+ 	if (state & LIMA_GP_IRQ_MASK_ERROR) {
+ 		if ((state & LIMA_GP_IRQ_MASK_ERROR) ==
+ 		    LIMA_GP_IRQ_PLBU_OUT_OF_MEM) {
+-			dev_dbg(dev->dev, "gp out of heap irq status=%x\n",
+-				status);
++			dev_dbg(dev->dev, "%s out of heap irq status=%x\n",
++				lima_ip_name(ip), status);
+ 		} else {
+-			dev_err(dev->dev, "gp error irq state=%x status=%x\n",
+-				state, status);
++			dev_err(dev->dev, "%s error irq state=%x status=%x\n",
++				lima_ip_name(ip), state, status);
+ 			if (task)
+ 				task->recoverable = false;
+ 		}
+@@ -89,7 +89,8 @@ static int lima_gp_soft_reset_async_wait(struct lima_ip *ip)
+ 				 v & LIMA_GP_IRQ_RESET_COMPLETED,
+ 				 0, 100);
+ 	if (err) {
+-		dev_err(dev->dev, "gp soft reset time out\n");
++		dev_err(dev->dev, "%s soft reset time out\n",
++			lima_ip_name(ip));
+ 		return err;
+ 	}
+ 
+@@ -166,6 +167,11 @@ static void lima_gp_task_run(struct lima_sched_pipe *pipe,
+ 	gp_write(LIMA_GP_CMD, cmd);
+ }
+ 
++static int lima_gp_bus_stop_poll(struct lima_ip *ip)
++{
++	return !!(gp_read(LIMA_GP_STATUS) & LIMA_GP_STATUS_BUS_STOPPED);
++}
++
+ static int lima_gp_hard_reset_poll(struct lima_ip *ip)
+ {
+ 	gp_write(LIMA_GP_PERF_CNT_0_LIMIT, 0xC01A0000);
+@@ -179,16 +185,30 @@ static int lima_gp_hard_reset(struct lima_ip *ip)
+ 
+ 	gp_write(LIMA_GP_PERF_CNT_0_LIMIT, 0xC0FFE000);
+ 	gp_write(LIMA_GP_INT_MASK, 0);
++
++	gp_write(LIMA_GP_CMD, LIMA_GP_CMD_STOP_BUS);
++	ret = lima_poll_timeout(ip, lima_gp_bus_stop_poll, 10, 100);
++	if (ret) {
++		dev_err(dev->dev, "%s bus stop timeout\n", lima_ip_name(ip));
++		return ret;
++	}
+ 	gp_write(LIMA_GP_CMD, LIMA_GP_CMD_RESET);
+ 	ret = lima_poll_timeout(ip, lima_gp_hard_reset_poll, 10, 100);
+ 	if (ret) {
+-		dev_err(dev->dev, "gp hard reset timeout\n");
++		dev_err(dev->dev, "%s hard reset timeout\n", lima_ip_name(ip));
+ 		return ret;
+ 	}
+ 
+ 	gp_write(LIMA_GP_PERF_CNT_0_LIMIT, 0);
+ 	gp_write(LIMA_GP_INT_CLEAR, LIMA_GP_IRQ_MASK_ALL);
+ 	gp_write(LIMA_GP_INT_MASK, LIMA_GP_IRQ_MASK_USED);
++
++	/*
++	 * if there was an async soft reset queued,
++	 * don't wait for it in the next job
++	 */
++	ip->data.async_reset = false;
++
+ 	return 0;
+ }
+ 
+@@ -201,8 +221,9 @@ static void lima_gp_task_error(struct lima_sched_pipe *pipe)
+ {
+ 	struct lima_ip *ip = pipe->processor[0];
+ 
+-	dev_err(ip->dev->dev, "gp task error int_state=%x status=%x\n",
+-		gp_read(LIMA_GP_INT_STAT), gp_read(LIMA_GP_STATUS));
++	dev_err(ip->dev->dev, "%s task error int_state=%x status=%x\n",
++		lima_ip_name(ip), gp_read(LIMA_GP_INT_STAT),
++		gp_read(LIMA_GP_STATUS));
+ 
+ 	lima_gp_hard_reset(ip);
+ }
+@@ -212,6 +233,13 @@ static void lima_gp_task_mmu_error(struct lima_sched_pipe *pipe)
+ 	lima_sched_pipe_task_done(pipe);
+ }
+ 
++static void lima_gp_task_mask_irq(struct lima_sched_pipe *pipe)
++{
++	struct lima_ip *ip = pipe->processor[0];
++
++	gp_write(LIMA_GP_INT_MASK, 0);
++}
++
+ static int lima_gp_task_recover(struct lima_sched_pipe *pipe)
+ {
+ 	struct lima_ip *ip = pipe->processor[0];
+@@ -305,7 +333,7 @@ int lima_gp_init(struct lima_ip *ip)
+ 	err = devm_request_irq(dev->dev, ip->irq, lima_gp_irq_handler,
+ 			       IRQF_SHARED, lima_ip_name(ip), ip);
+ 	if (err) {
+-		dev_err(dev->dev, "gp %s fail to request irq\n",
++		dev_err(dev->dev, "%s fail to request irq\n",
+ 			lima_ip_name(ip));
+ 		return err;
+ 	}
+@@ -317,7 +345,9 @@ int lima_gp_init(struct lima_ip *ip)
+ 
+ void lima_gp_fini(struct lima_ip *ip)
+ {
++	struct lima_device *dev = ip->dev;
+ 
++	devm_free_irq(dev->dev, ip->irq, ip);
+ }
+ 
+ int lima_gp_pipe_init(struct lima_device *dev)
+@@ -344,6 +374,7 @@ int lima_gp_pipe_init(struct lima_device *dev)
+ 	pipe->task_error = lima_gp_task_error;
+ 	pipe->task_mmu_error = lima_gp_task_mmu_error;
+ 	pipe->task_recover = lima_gp_task_recover;
++	pipe->task_mask_irq = lima_gp_task_mask_irq;
+ 
+ 	return 0;
+ }
+diff --git a/drivers/gpu/drm/lima/lima_pp.c b/drivers/gpu/drm/lima/lima_pp.c
+index a5c95bed0..eaab4788d 100644
+--- a/drivers/gpu/drm/lima/lima_pp.c
++++ b/drivers/gpu/drm/lima/lima_pp.c
+@@ -26,8 +26,8 @@ static void lima_pp_handle_irq(struct lima_ip *ip, u32 state)
+ 	if (state & LIMA_PP_IRQ_MASK_ERROR) {
+ 		u32 status = pp_read(LIMA_PP_STATUS);
+ 
+-		dev_err(dev->dev, "pp error irq state=%x status=%x\n",
+-			state, status);
++		dev_err(dev->dev, "%s error irq state=%x status=%x\n",
++			lima_ip_name(ip), state, status);
+ 
+ 		pipe->error = true;
+ 
+@@ -125,7 +125,7 @@ static int lima_pp_soft_reset_async_wait_one(struct lima_ip *ip)
+ 
+ 	ret = lima_poll_timeout(ip, lima_pp_soft_reset_poll, 0, 100);
+ 	if (ret) {
+-		dev_err(dev->dev, "pp %s reset time out\n", lima_ip_name(ip));
++		dev_err(dev->dev, "%s reset time out\n", lima_ip_name(ip));
+ 		return ret;
+ 	}
+ 
+@@ -168,6 +168,11 @@ static void lima_pp_write_frame(struct lima_ip *ip, u32 *frame, u32 *wb)
+ 	}
+ }
+ 
++static int lima_pp_bus_stop_poll(struct lima_ip *ip)
++{
++	return !!(pp_read(LIMA_PP_STATUS) & LIMA_PP_STATUS_BUS_STOPPED);
++}
++
+ static int lima_pp_hard_reset_poll(struct lima_ip *ip)
+ {
+ 	pp_write(LIMA_PP_PERF_CNT_0_LIMIT, 0xC01A0000);
+@@ -181,16 +186,31 @@ static int lima_pp_hard_reset(struct lima_ip *ip)
+ 
+ 	pp_write(LIMA_PP_PERF_CNT_0_LIMIT, 0xC0FFE000);
+ 	pp_write(LIMA_PP_INT_MASK, 0);
++
++	pp_write(LIMA_PP_CTRL, LIMA_PP_CTRL_STOP_BUS);
++	ret = lima_poll_timeout(ip, lima_pp_bus_stop_poll, 10, 100);
++	if (ret) {
++		dev_err(dev->dev, "%s bus stop timeout\n", lima_ip_name(ip));
++		return ret;
++	}
++
+ 	pp_write(LIMA_PP_CTRL, LIMA_PP_CTRL_FORCE_RESET);
+ 	ret = lima_poll_timeout(ip, lima_pp_hard_reset_poll, 10, 100);
+ 	if (ret) {
+-		dev_err(dev->dev, "pp hard reset timeout\n");
++		dev_err(dev->dev, "%s hard reset timeout\n", lima_ip_name(ip));
+ 		return ret;
+ 	}
+ 
+ 	pp_write(LIMA_PP_PERF_CNT_0_LIMIT, 0);
+ 	pp_write(LIMA_PP_INT_CLEAR, LIMA_PP_IRQ_MASK_ALL);
+ 	pp_write(LIMA_PP_INT_MASK, LIMA_PP_IRQ_MASK_USED);
++
++	/*
++	 * if there was an async soft reset queued,
++	 * don't wait for it in the next job
++	 */
++	ip->data.async_reset = false;
++
+ 	return 0;
+ }
+ 
+@@ -254,7 +274,7 @@ int lima_pp_init(struct lima_ip *ip)
+ 	err = devm_request_irq(dev->dev, ip->irq, lima_pp_irq_handler,
+ 			       IRQF_SHARED, lima_ip_name(ip), ip);
+ 	if (err) {
+-		dev_err(dev->dev, "pp %s fail to request irq\n",
++		dev_err(dev->dev, "%s fail to request irq\n",
+ 			lima_ip_name(ip));
+ 		return err;
+ 	}
+@@ -266,7 +286,9 @@ int lima_pp_init(struct lima_ip *ip)
+ 
+ void lima_pp_fini(struct lima_ip *ip)
+ {
++	struct lima_device *dev = ip->dev;
+ 
++	devm_free_irq(dev->dev, ip->irq, ip);
+ }
+ 
+ int lima_pp_bcast_resume(struct lima_ip *ip)
+@@ -289,7 +311,7 @@ int lima_pp_bcast_init(struct lima_ip *ip)
+ 	err = devm_request_irq(dev->dev, ip->irq, lima_pp_bcast_irq_handler,
+ 			       IRQF_SHARED, lima_ip_name(ip), ip);
+ 	if (err) {
+-		dev_err(dev->dev, "pp %s fail to request irq\n",
++		dev_err(dev->dev, "%s fail to request irq\n",
+ 			lima_ip_name(ip));
+ 		return err;
+ 	}
+@@ -299,7 +321,9 @@ int lima_pp_bcast_init(struct lima_ip *ip)
+ 
+ void lima_pp_bcast_fini(struct lima_ip *ip)
+ {
++	struct lima_device *dev = ip->dev;
+ 
++	devm_free_irq(dev->dev, ip->irq, ip);
+ }
+ 
+ static int lima_pp_task_validate(struct lima_sched_pipe *pipe,
+@@ -403,11 +427,15 @@ static void lima_pp_task_error(struct lima_sched_pipe *pipe)
+ 	for (i = 0; i < pipe->num_processor; i++) {
+ 		struct lima_ip *ip = pipe->processor[i];
+ 
+-		dev_err(ip->dev->dev, "pp task error %d int_state=%x status=%x\n",
+-			i, pp_read(LIMA_PP_INT_STATUS), pp_read(LIMA_PP_STATUS));
++		dev_err(ip->dev->dev, "%s task error %d int_state=%x status=%x\n",
++			lima_ip_name(ip), i, pp_read(LIMA_PP_INT_STATUS),
++			pp_read(LIMA_PP_STATUS));
+ 
+ 		lima_pp_hard_reset(ip);
+ 	}
++
++	if (pipe->bcast_processor)
++		lima_bcast_reset(pipe->bcast_processor);
+ }
+ 
+ static void lima_pp_task_mmu_error(struct lima_sched_pipe *pipe)
+@@ -416,6 +444,20 @@ static void lima_pp_task_mmu_error(struct lima_sched_pipe *pipe)
+ 		lima_sched_pipe_task_done(pipe);
+ }
+ 
++static void lima_pp_task_mask_irq(struct lima_sched_pipe *pipe)
++{
++	int i;
++
++	for (i = 0; i < pipe->num_processor; i++) {
++		struct lima_ip *ip = pipe->processor[i];
++
++		pp_write(LIMA_PP_INT_MASK, 0);
++	}
++
++	if (pipe->bcast_processor)
++		lima_bcast_mask_irq(pipe->bcast_processor);
++}
++
+ static struct kmem_cache *lima_pp_task_slab;
+ static int lima_pp_task_slab_refcnt;
+ 
+@@ -447,6 +489,7 @@ int lima_pp_pipe_init(struct lima_device *dev)
+ 	pipe->task_fini = lima_pp_task_fini;
+ 	pipe->task_error = lima_pp_task_error;
+ 	pipe->task_mmu_error = lima_pp_task_mmu_error;
++	pipe->task_mask_irq = lima_pp_task_mask_irq;
+ 
+ 	return 0;
+ }
+diff --git a/drivers/gpu/drm/lima/lima_sched.c b/drivers/gpu/drm/lima/lima_sched.c
+index ffd91a5ee..893bc0bc4 100644
+--- a/drivers/gpu/drm/lima/lima_sched.c
++++ b/drivers/gpu/drm/lima/lima_sched.c
+@@ -1,6 +1,7 @@
+ // SPDX-License-Identifier: GPL-2.0 OR MIT
+ /* Copyright 2017-2019 Qiang Yu <yuq825@gmail.com> */
+ 
++#include <linux/hardirq.h>
+ #include <linux/iosys-map.h>
+ #include <linux/kthread.h>
+ #include <linux/slab.h>
+@@ -401,9 +402,44 @@ static enum drm_gpu_sched_stat lima_sched_timedout_job(struct drm_sched_job *job
+ 	struct lima_sched_pipe *pipe = to_lima_pipe(job->sched);
+ 	struct lima_sched_task *task = to_lima_task(job);
+ 	struct lima_device *ldev = pipe->ldev;
++	struct lima_ip *ip = pipe->processor[0];
++	int i;
++
++	/*
++	 * If the GPU managed to complete this jobs fence, the timeout is
++	 * spurious. Bail out.
++	 */
++	if (dma_fence_is_signaled(task->fence)) {
++		DRM_WARN("%s spurious timeout\n", lima_ip_name(ip));
++		return DRM_GPU_SCHED_STAT_NOMINAL;
++	}
++
++	/*
++	 * Lima IRQ handler may take a long time to process an interrupt
++	 * if there is another IRQ handler hogging the processing.
++	 * In order to catch such cases and not report spurious Lima job
++	 * timeouts, synchronize the IRQ handler and re-check the fence
++	 * status.
++	 */
++	for (i = 0; i < pipe->num_processor; i++)
++		synchronize_irq(pipe->processor[i]->irq);
++	if (pipe->bcast_processor)
++		synchronize_irq(pipe->bcast_processor->irq);
++
++	if (dma_fence_is_signaled(task->fence)) {
++		DRM_WARN("%s unexpectedly high interrupt latency\n", lima_ip_name(ip));
++		return DRM_GPU_SCHED_STAT_NOMINAL;
++	}
++
++	/*
++	 * The task might still finish while this timeout handler runs.
++	 * To prevent a race condition on its completion, mask all irqs
++	 * on the running core until the next hard reset completes.
++	 */
++	pipe->task_mask_irq(pipe);
+ 
+ 	if (!pipe->error)
+-		DRM_ERROR("lima job timeout\n");
++		DRM_ERROR("%s job timeout\n", lima_ip_name(ip));
+ 
+ 	drm_sched_stop(&pipe->base, &task->base);
+ 
+@@ -417,8 +453,6 @@ static enum drm_gpu_sched_stat lima_sched_timedout_job(struct drm_sched_job *job
+ 	if (pipe->bcast_mmu)
+ 		lima_mmu_page_fault_resume(pipe->bcast_mmu);
+ 	else {
+-		int i;
+-
+ 		for (i = 0; i < pipe->num_mmu; i++)
+ 			lima_mmu_page_fault_resume(pipe->mmu[i]);
+ 	}
+@@ -481,7 +515,7 @@ static void lima_sched_recover_work(struct work_struct *work)
+ int lima_sched_pipe_init(struct lima_sched_pipe *pipe, const char *name)
+ {
+ 	unsigned int timeout = lima_sched_timeout_ms > 0 ?
+-			       lima_sched_timeout_ms : 500;
++			       lima_sched_timeout_ms : 10000;
+ 
+ 	pipe->fence_context = dma_fence_context_alloc(1);
+ 	spin_lock_init(&pipe->fence_lock);
+diff --git a/drivers/gpu/drm/lima/lima_sched.h b/drivers/gpu/drm/lima/lima_sched.h
+index 6a11764d8..edf205be4 100644
+--- a/drivers/gpu/drm/lima/lima_sched.h
++++ b/drivers/gpu/drm/lima/lima_sched.h
+@@ -80,6 +80,7 @@ struct lima_sched_pipe {
+ 	void (*task_error)(struct lima_sched_pipe *pipe);
+ 	void (*task_mmu_error)(struct lima_sched_pipe *pipe);
+ 	int (*task_recover)(struct lima_sched_pipe *pipe);
++	void (*task_mask_irq)(struct lima_sched_pipe *pipe);
+ 
+ 	struct work_struct recover_work;
+ };
+diff --git a/drivers/media/rc/ir-hix5hd2.c b/drivers/media/rc/ir-hix5hd2.c
+index 0034f615b..196d2e251 100644
+--- a/drivers/media/rc/ir-hix5hd2.c
++++ b/drivers/media/rc/ir-hix5hd2.c
+@@ -142,12 +142,12 @@ static int hix5hd2_ir_config(struct hix5hd2_ir_priv *priv)
+ 
+ 	/* Now only support raw mode, with symbol start from low to high */
+ 	rate = DIV_ROUND_CLOSEST(priv->rate, 1000000);
+-	val = IR_CFG_SYMBOL_MAXWIDTH & IR_CFG_WIDTH_MASK << IR_CFG_WIDTH_SHIFT;
+-	val |= IR_CFG_SYMBOL_FMT & IR_CFG_FORMAT_MASK << IR_CFG_FORMAT_SHIFT;
+-	val |= (IR_CFG_INT_THRESHOLD - 1) & IR_CFG_INT_LEVEL_MASK
++	val = (IR_CFG_SYMBOL_MAXWIDTH & IR_CFG_WIDTH_MASK) << IR_CFG_WIDTH_SHIFT;
++	val |= (IR_CFG_SYMBOL_FMT & IR_CFG_FORMAT_MASK) << IR_CFG_FORMAT_SHIFT;
++	val |= ((IR_CFG_INT_THRESHOLD - 1) & IR_CFG_INT_LEVEL_MASK)
+ 	       << IR_CFG_INT_LEVEL_SHIFT;
+ 	val |= IR_CFG_MODE_RAW;
+-	val |= (rate - 1) & IR_CFG_FREQ_MASK << IR_CFG_FREQ_SHIFT;
++	val |= ((rate - 1) & IR_CFG_FREQ_MASK) << IR_CFG_FREQ_SHIFT;
+ 	writel_relaxed(val, priv->base + IR_CONFIG);
+ 
+ 	writel_relaxed(0x00, priv->base + IR_INTM);
+diff --git a/drivers/net/ethernet/hisilicon/hisi_femac.c b/drivers/net/ethernet/hisilicon/hisi_femac.c
+index cb7b0293f..182abda2f 100644
+--- a/drivers/net/ethernet/hisilicon/hisi_femac.c
++++ b/drivers/net/ethernet/hisilicon/hisi_femac.c
+@@ -59,6 +59,8 @@
+ #define MACTCTRL_MULTI2CPU		BIT(3)
+ #define MACTCTRL_BROAD2CPU		BIT(5)
+ #define MACTCTRL_MACT_ENA		BIT(7)
++#define GLB_ENDIAN_MOD			0x0018
++#define ENDIAN_MOD_IN_OUT		(BIT(1) | BIT(0))
+ #define GLB_IRQ_STAT			0x0030
+ #define GLB_IRQ_ENA			0x0034
+ #define IRQ_ENA_PORT0_MASK		GENMASK(7, 0)
+@@ -739,6 +741,10 @@ static void hisi_femac_port_init(struct hisi_femac_priv *priv)
+ 		val |= MAC_PORTSEL_RMII;
+ 	writel(val, priv->port_base + MAC_PORTSEL);
+ 
++	/* little-endian DMA descriptors/data (as vendor hieth-sf driver does) */
++	val = readl(priv->glb_base + GLB_ENDIAN_MOD);
++	writel(val | ENDIAN_MOD_IN_OUT, priv->glb_base + GLB_ENDIAN_MOD);
++
+ 	/*clear all interrupt status */
+ 	writel(IRQ_ENA_PORT0_MASK, priv->glb_base + GLB_IRQ_RAW);
+ 	hisi_femac_irq_disable(priv, IRQ_ENA_PORT0_MASK | IRQ_ENA_PORT0);
+@@ -810,7 +816,8 @@ static int hisi_femac_drv_probe(struct platform_device *pdev)
+ 		goto out_free_netdev;
+ 	}
+ 
+-	priv->mac_rst = devm_reset_control_get(dev, "mac");
++	/* Hi3798MV100 (hieth-sf): no reset controller modelled, U-Boot leaves MAC out of reset */
++	priv->mac_rst = devm_reset_control_get_optional_exclusive(dev, "mac");
+ 	if (IS_ERR(priv->mac_rst)) {
+ 		ret = PTR_ERR(priv->mac_rst);
+ 		goto out_disable_clk;
+diff --git a/drivers/phy/hisilicon/Kconfig b/drivers/phy/hisilicon/Kconfig
+index 6c89136fc..71698127f 100644
+--- a/drivers/phy/hisilicon/Kconfig
++++ b/drivers/phy/hisilicon/Kconfig
+@@ -52,6 +52,14 @@ config PHY_HISTB_COMBPHY
+ 	  Enable this to support the HISILICON STB SoCs COMBPHY.
+ 	  If unsure, say N.
+ 
++config PHY_HI3798MV100_USB2
++	tristate "HiSilicon Hi3798MV100 USB2 host PHY support"
++	depends on (ARCH_HISI && ARM) || COMPILE_TEST
++	select GENERIC_PHY
++	help
++	  Clock/reset and INNO PHY test-bus initialisation for the EHCI/OHCI
++	  host controllers of the HiSilicon Hi3798MV100 SoC.
++
+ config PHY_HISI_INNO_USB2
+ 	tristate "HiSilicon INNO USB2 PHY support"
+ 	depends on ARCH_HISI || COMPILE_TEST
+diff --git a/drivers/phy/hisilicon/Makefile b/drivers/phy/hisilicon/Makefile
+index 4029d3813..b8425ec58 100644
+--- a/drivers/phy/hisilicon/Makefile
++++ b/drivers/phy/hisilicon/Makefile
+@@ -6,3 +6,4 @@ obj-$(CONFIG_PHY_HI3670_PCIE)		+= phy-hi3670-pcie.o
+ obj-$(CONFIG_PHY_HISTB_COMBPHY)		+= phy-histb-combphy.o
+ obj-$(CONFIG_PHY_HISI_INNO_USB2)	+= phy-hisi-inno-usb2.o
+ obj-$(CONFIG_PHY_HIX5HD2_SATA)		+= phy-hix5hd2-sata.o
++obj-$(CONFIG_PHY_HI3798MV100_USB2)	+= phy-hi3798mv100-usb2.o
+diff --git a/drivers/soc/hisilicon/Kconfig b/drivers/soc/hisilicon/Kconfig
+index 0ab688af3..7d4197a21 100644
+--- a/drivers/soc/hisilicon/Kconfig
++++ b/drivers/soc/hisilicon/Kconfig
+@@ -19,3 +19,10 @@ config KUNPENG_HCCS
+ 	  health status and port information of HCCS on Kunpeng SoC.
+ 
+ endmenu
++
++config HI3798MV100_GPU
++	tristate "Hi3798MV100 Mali-450 bring-up glue"
++	depends on ARCH_HISI || COMPILE_TEST
++	help
++	  Enables the Mali-450 clocks/reset on the Hi3798MV100 and
++	  populates the lima child node.
+diff --git a/drivers/soc/hisilicon/Makefile b/drivers/soc/hisilicon/Makefile
+index 226e747e7..465781bb7 100644
+--- a/drivers/soc/hisilicon/Makefile
++++ b/drivers/soc/hisilicon/Makefile
+@@ -1,2 +1,3 @@
+ # SPDX-License-Identifier: GPL-2.0-only
+ obj-$(CONFIG_KUNPENG_HCCS)	+= kunpeng_hccs.o
++obj-$(CONFIG_HI3798MV100_GPU)	+= hi3798mv100-gpu.o
+diff --git a/drivers/thermal/Kconfig b/drivers/thermal/Kconfig
+index c81a00fbc..56e4666d7 100644
+--- a/drivers/thermal/Kconfig
++++ b/drivers/thermal/Kconfig
+@@ -317,6 +317,13 @@ config QORIQ_THERMAL
+ 	  cpufreq is used as the cooling device to throttle CPUs when the
+ 	  passive trip is crossed.
+ 
++config HI3798MV100_THERMAL
++	tristate "Hi3798MV100 temperature sensor"
++	depends on ARCH_HISI || COMPILE_TEST
++	depends on OF
++	help
++	  On-die temperature sensor of the Hi3798MV100 SoC.
++
+ config SPEAR_THERMAL
+ 	tristate "SPEAr thermal sensor driver"
+ 	depends on PLAT_SPEAR || COMPILE_TEST
+diff --git a/drivers/thermal/Makefile b/drivers/thermal/Makefile
+index c934cab30..72d3cfbb0 100644
+--- a/drivers/thermal/Makefile
++++ b/drivers/thermal/Makefile
+@@ -34,6 +34,7 @@ obj-$(CONFIG_K3_THERMAL)	+= k3_bandgap.o k3_j72xx_bandgap.o
+ # platform thermal drivers
+ obj-y				+= broadcom/
+ obj-$(CONFIG_THERMAL_MMIO)		+= thermal_mmio.o
++obj-$(CONFIG_HI3798MV100_THERMAL)	+= hi3798mv100_thermal.o
+ obj-$(CONFIG_SPEAR_THERMAL)	+= spear_thermal.o
+ obj-$(CONFIG_SUN8I_THERMAL)     += sun8i_thermal.o
+ obj-$(CONFIG_ROCKCHIP_THERMAL)	+= rockchip_thermal.o
+diff --git a/drivers/usb/host/Kconfig b/drivers/usb/host/Kconfig
+index 4448d0ab0..cee3ecd21 100644
+--- a/drivers/usb/host/Kconfig
++++ b/drivers/usb/host/Kconfig
+@@ -51,6 +51,13 @@ config USB_XHCI_PCI_RENESAS
+ 	  installed on your system for this device to work.
+ 	  If unsure, say 'N'.
+ 
++config USB_XHCI_HI3798MV100
++	tristate "Hi3798MV100 USB3 glue"
++	depends on USB_XHCI_PLATFORM && (ARCH_HISI || COMPILE_TEST)
++	help
++	  Brings up the DWC3-based USB3 controller of the Hi3798MV100 and
++	  populates its generic-xhci child.
++
+ config USB_XHCI_PLATFORM
+ 	tristate "Generic xHCI driver for a platform device"
+ 	help
+diff --git a/drivers/usb/host/Makefile b/drivers/usb/host/Makefile
+index be4e5245c..ec25605c1 100644
+--- a/drivers/usb/host/Makefile
++++ b/drivers/usb/host/Makefile
+@@ -69,6 +69,7 @@ obj-$(CONFIG_USB_FHCI_HCD)	+= fhci.o
+ obj-$(CONFIG_USB_XHCI_HCD)	+= xhci-hcd.o
+ obj-$(CONFIG_USB_XHCI_PCI)	+= xhci-pci.o
+ obj-$(CONFIG_USB_XHCI_PCI_RENESAS)	+= xhci-pci-renesas.o
++obj-$(CONFIG_USB_XHCI_HI3798MV100) += xhci-hi3798mv100.o
+ obj-$(CONFIG_USB_XHCI_PLATFORM) += xhci-plat-hcd.o
+ obj-$(CONFIG_USB_XHCI_HISTB)	+= xhci-histb.o
+ obj-$(CONFIG_USB_XHCI_RCAR)	+= xhci-rcar-hcd.o
+diff --git a/include/linux/cpuhotplug.h b/include/linux/cpuhotplug.h
+index 068f7738b..59a6bf2ae 100644
+--- a/include/linux/cpuhotplug.h
++++ b/include/linux/cpuhotplug.h
+@@ -177,6 +177,7 @@ enum cpuhp_state {
+ 	CPUHP_AP_ARM_TWD_STARTING,
+ 	CPUHP_AP_QCOM_TIMER_STARTING,
+ 	CPUHP_AP_TEGRA_TIMER_STARTING,
++	CPUHP_AP_HI3798_TIMER_STARTING,
+ 	CPUHP_AP_ARMADA_TIMER_STARTING,
+ 	CPUHP_AP_MARCO_TIMER_STARTING,
+ 	CPUHP_AP_MIPS_GIC_TIMER_STARTING,
+diff --git a/arch/arm/boot/dts/hisilicon/hi3798mv100.dtsi b/arch/arm/boot/dts/hisilicon/hi3798mv100.dtsi
+new file mode 100644
+index 000000000..d60c0872a
+--- /dev/null
++++ b/arch/arm/boot/dts/hisilicon/hi3798mv100.dtsi
+@@ -0,0 +1,525 @@
++// SPDX-License-Identifier: GPL-2.0-or-later
++/*
++ * HiSilicon Hi3798Mv100 SoC device tree source
++ *
++ * Based on reverse engineering from vendor kernel 3.10.0_s40
++ * Machine: "bigfish" (HiSTBAndroidV600R001C00SPC062)
++ */
++
++#include <dt-bindings/interrupt-controller/arm-gic.h>
++#include <dt-bindings/thermal/thermal.h>
++#include <dt-bindings/clock/histb-clock.h>
++
++/ {
++	#address-cells = <1>;
++	#size-cells = <1>;
++
++	interrupt-parent = <&gic>;
++
++	cpus {
++		#address-cells = <1>;
++		#size-cells = <0>;
++
++		cpu0: cpu@0 {
++			device_type = "cpu";
++			compatible = "arm,cortex-a7";
++			reg = <0x0>;
++			enable-method = "hisilicon,hi3798mv100-smp";
++			#cooling-cells = <2>;
++		};
++
++		cpu@1 {
++			device_type = "cpu";
++			compatible = "arm,cortex-a7";
++			reg = <0x1>;
++			enable-method = "hisilicon,hi3798mv100-smp";
++		};
++
++		cpu@2 {
++			device_type = "cpu";
++			compatible = "arm,cortex-a7";
++			reg = <0x2>;
++			enable-method = "hisilicon,hi3798mv100-smp";
++		};
++
++		cpu@3 {
++			device_type = "cpu";
++			compatible = "arm,cortex-a7";
++			reg = <0x3>;
++			enable-method = "hisilicon,hi3798mv100-smp";
++		};
++	};
++
++	/*
++	 * Verified from U-Boot (b31): GICD_IIDR=0x0100143b, TYPER=0xfc65 (192 IRQs, 4 CPUs),
++	 * ITARGETSR=0x01010101; GICC_IIDR=0x0102143b. Old 0x10301000 was plain DRAM.
++	 */
++	gic: interrupt-controller@f8a01000 {
++		compatible = "arm,cortex-a7-gic";
++		#interrupt-cells = <3>;
++		#address-cells = <0>;
++		interrupt-controller;
++		reg = <0xf8a01000 0x1000>, <0xf8a02000 0x2000>;
++	};
++
++	timer {
++		compatible = "arm,armv7-timer";
++		/* CNTVCT reads garbage; vendor kernel uses SP804 instead */
++		status = "disabled";
++		interrupts = <GIC_PPI 13 (GIC_CPU_MASK_SIMPLE(4) | IRQ_TYPE_LEVEL_LOW)>,
++			     <GIC_PPI 14 (GIC_CPU_MASK_SIMPLE(4) | IRQ_TYPE_LEVEL_LOW)>,
++			     <GIC_PPI 11 (GIC_CPU_MASK_SIMPLE(4) | IRQ_TYPE_LEVEL_LOW)>,
++			     <GIC_PPI 10 (GIC_CPU_MASK_SIMPLE(4) | IRQ_TYPE_LEVEL_LOW)>;
++		clock-frequency = <24000000>;
++	};
++
++	pmu {
++		compatible = "arm,cortex-a7-pmu";
++		/* IRQ unknown (old value was TDE's line) */
++		status = "disabled";
++	};
++
++	clk_24m: clk_24m {
++		compatible = "fixed-clock";
++		#clock-cells = <0>;
++		clock-frequency = <24000000>;
++	};
++
++	clk_25m: clk_25m {
++		compatible = "fixed-clock";
++		#clock-cells = <0>;
++		clock-frequency = <25000000>;
++	};
++
++	clk_50m: clk_50m {
++		compatible = "fixed-clock";
++		#clock-cells = <0>;
++		clock-frequency = <50000000>;
++	};
++
++	clk_100m: clk_100m {
++		compatible = "fixed-clock";
++		#clock-cells = <0>;
++		clock-frequency = <100000000>;
++	};
++
++	clk_200m: clk_200m {
++		compatible = "fixed-clock";
++		#clock-cells = <0>;
++		clock-frequency = <200000000>;
++	};
++
++	clk_125m: clk_125m {
++		compatible = "fixed-clock";
++		#clock-cells = <0>;
++		clock-frequency = <125000000>;
++	};
++
++	clk_uart0: clk_uart0 {
++		compatible = "fixed-clock";
++		#clock-cells = <0>;
++		/* Actual UART0 hardware clock ~83.3 MHz (measured via IBRD=45 FBRD=12 at 115200) */
++		clock-frequency = <83289600>;
++	};
++
++	clk_timer: clk_timer {
++		compatible = "fixed-clock";
++		#clock-cells = <0>;
++		clock-frequency = <24000000>;
++	};
++
++	/*
++	 * CPU clock switch (CRG+0x48) and per-core resets (CRG+0x50) used by the
++	 * hi3798mv100 SMP ops; secondaries enter via a trampoline at 0xffff0000.
++	 */
++	cpuctrl: cpu-controller@f8a22048 {
++		compatible = "hisilicon,hi3798mv100-cpuctrl";
++		reg = <0xf8a22048 0x10>;
++		/* boot at 800 MHz; hi3798mv100-cpufreq then switches 800/1200 MHz under thermal control */
++		hisilicon,cpu-clk-sel = <1>;
++	};
++
++	/* T-sensor (PMC10/12/13), decoded from the stock kernel's mpu_get_temperature */
++	tsensor: thermal-sensor@f8a23028 {
++		compatible = "hisilicon,hi3798mv100-tsensor";
++		reg = <0xf8a23028 0x10>;
++		#thermal-sensor-cells = <0>;
++	};
++
++	/*
++	 * Stock cooling at 1.2 GHz x4: 84 C after 5 min, memory-heavy load hangs ~90 C.
++	 * 800 MHz holds. Throttle to 800 MHz at 75 C, orderly shutdown at 95 C.
++	 */
++	thermal-zones {
++		cpu_thermal: cpu-thermal {
++			polling-delay-passive = <1000>;
++			polling-delay = <2000>;
++			thermal-sensors = <&tsensor>;
++
++			trips {
++				cpu_alert: cpu-alert {
++					temperature = <75000>;
++					hysteresis = <5000>;
++					type = "passive";
++				};
++				cpu_crit: cpu-crit {
++					temperature = <95000>;
++					hysteresis = <2000>;
++					type = "critical";
++				};
++			};
++
++			cooling-maps {
++				map0 {
++					trip = <&cpu_alert>;
++					cooling-device = <&cpu0 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>;
++				};
++				map1 {
++					trip = <&cpu_alert>;
++					cooling-device = <&mali THERMAL_NO_LIMIT THERMAL_NO_LIMIT>;
++				};
++			};
++		};
++	};
++
++	/* System controller; SC_SYSRES at +0x4 (write 0xdeadbeef = reset), as on Hi3798CV200 */
++	sysctrl: system-controller@f8000000 {
++		compatible = "syscon";
++		reg = <0xf8000000 0x1000>;
++	};
++
++	reboot {
++		compatible = "syscon-reboot";
++		regmap = <&sysctrl>;
++		offset = <0x4>;
++		value = <0xdeadbeef>;
++	};
++
++	soc {
++		#address-cells = <1>;
++		#size-cells = <1>;
++		compatible = "simple-bus";
++		ranges;
++
++		uart0_clk: uart0_clk {
++			compatible = "fixed-clock";
++			#clock-cells = <0>;
++			clock-frequency = <24000000>;
++		};
++
++		uart0: serial@f8b00000 {
++			compatible = "arm,pl011", "arm,primecell";
++			reg = <0xf8b00000 0x1000>;
++			arm,primecell-periphid = <0x00041011>;
++			interrupts = <GIC_SPI 49 IRQ_TYPE_LEVEL_HIGH>;
++			clocks = <&clk_uart0>, <&clk_100m>;
++			clock-names = "uartclk", "apb_pclk";
++			reg-io-width = <4>;
++			status = "disabled";
++		};
++
++		uart1: serial@f8006000 {
++			compatible = "arm,pl011", "arm,primecell";
++			reg = <0xf8006000 0x1000>;
++			arm,primecell-periphid = <0x00041011>;
++			interrupts = <GIC_SPI 50 IRQ_TYPE_LEVEL_HIGH>;
++			clocks = <&clk_24m>, <&clk_100m>;
++			clock-names = "uartclk", "apb_pclk";
++			status = "disabled";
++		};
++
++		uart2: serial@f8b02000 {
++			compatible = "arm,pl011", "arm,primecell";
++			reg = <0xf8b02000 0x1000>;
++			arm,primecell-periphid = <0x00041011>;
++			interrupts = <GIC_SPI 51 IRQ_TYPE_LEVEL_HIGH>;
++			clocks = <&clk_uart0>, <&clk_100m>;
++			clock-names = "uartclk", "apb_pclk";
++			status = "disabled";
++		};
++
++		/*
++		 * eMMC = hi_mci.1 @ f9830000, GIC 67 (SPI 35) -- confirmed by vendor /proc/interrupts.
++		 * CRG 0xa0 (PERI_CRG40) = 0x00040103 set by U-Boot: clk_sel[9:8]=01 -> ciu 100 MHz
++		 * (fastboot SDIO1_CLK_SEL_100M, MMC_CLK 100000000), drive phase [18:16]=180 deg,
++		 * sample phase [14:12]=0 deg -- same values the stock kernel uses for DDR52.
++		 * Before b44 the ciu was wrongly described as 50 MHz, so every card clock was 2x the
++		 * requested one (the b31 "HS 50 MHz" CRC errors were really 100 MHz).
++		 */
++		mmc0: mmc@f9830000 {
++			compatible = "snps,dw-mshc";
++			reg = <0xf9830000 0x1000>;
++			interrupts = <GIC_SPI 35 IRQ_TYPE_LEVEL_HIGH>;
++			clocks = <&clk_100m>, <&clk_100m>;
++			clock-names = "biu", "ciu";
++			fifo-depth = <256>;
++			max-frequency = <50000000>;
++			cap-mmc-highspeed;
++			mmc-ddr-3_3v;
++			bus-width = <8>;
++			non-removable;
++			disable-wp;
++			status = "disabled";
++		};
++
++		/* SD slot = hi_mci.0 @ f9820000, GIC 66 (SPI 34). CRG 0x9c = 0x203, mux[9:8]=2 -> ciu 50 MHz.
++		 * Native CDETECT works (vendor himciv200 uses it); I/O LDO 0xf8a2011c left as U-Boot set it. */
++		mmc1: mmc@f9820000 {
++			compatible = "snps,dw-mshc";
++			reg = <0xf9820000 0x1000>;
++			interrupts = <GIC_SPI 34 IRQ_TYPE_LEVEL_HIGH>;
++			clocks = <&clk_100m>, <&clk_50m>;
++			clock-names = "biu", "ciu";
++			fifo-depth = <256>;
++			bus-width = <4>;
++			max-frequency = <50000000>;
++			cap-sd-highspeed;
++			disable-wp;
++			post-power-on-delay-ms = <200>; /* vendor himciv200 waits 100 ms after PWREN */
++			status = "disabled";
++		};
++
++		/*
++		 * hieth-sf (SDK "hieth", sfv300) @ f9840000 = same IP as mainline hisi-femac:
++		 * up-port regs @ +0x0000, MDIO @ +0x1100, GLB @ +0x1300 (down port @ +0x2000 unused).
++		 * Vendor IRQ GIC 103 -> SPI 71. Internal FE PHY (FESTA) at MDIO addr 1; U-Boot
++		 * initialises PHY clock/reset/address/fixups on every boot (CRG 0xf8a22000 + 0x388).
++		 */
++		mdio0: mdio@f9841100 {
++			compatible = "hisilicon,hisi-femac-mdio";
++			reg = <0xf9841100 0x10>;
++			clocks = <&clk_50m>;
++			#address-cells = <1>;
++			#size-cells = <0>;
++			status = "disabled";
++
++			fephy: ethernet-phy@1 {
++				reg = <1>;
++			};
++		};
++
++		femac: ethernet@f9840000 {
++			compatible = "hisilicon,hisi-femac-v1";
++			reg = <0xf9840000 0x1000>, <0xf9841300 0x200>;
++			interrupts = <GIC_SPI 71 IRQ_TYPE_LEVEL_HIGH>;
++			clocks = <&clk_50m>;
++			phy-handle = <&fephy>;
++			phy-mode = "mii";
++			status = "disabled";
++		};
++
++		/*
++		 * USB2 host PHYs: not memory mapped. Clock/reset in CRG (f8a22000 +0xb8/0xbc,
++		 * +0x190/0x198), INNO PHY test bus in PERI_CTRL (f8a20000 +0x124/+0x158).
++		 * U-Boot "usb stop" leaves all of it in reset. Cell 0 = host0, 1 = host1.
++		 */
++		usb2_phy: usb-phy@f8a22000 {
++			compatible = "hisilicon,hi3798mv100-usb2-host-phy";
++			reg = <0xf8a22000 0x1000>, <0xf8a20000 0x1000>;
++			#phy-cells = <1>;
++		};
++
++		ehci0: usb@f9890000 {
++			compatible = "generic-ehci";
++			reg = <0xf9890000 0x10000>;
++			interrupts = <GIC_SPI 66 IRQ_TYPE_LEVEL_HIGH>;
++			phys = <&usb2_phy 0>;
++			phy-names = "usb";
++			status = "disabled";
++		};
++
++		ohci0: usb@f9880000 {
++			compatible = "generic-ohci";
++			reg = <0xf9880000 0x10000>;
++			interrupts = <GIC_SPI 67 IRQ_TYPE_LEVEL_HIGH>;
++			phys = <&usb2_phy 0>;
++			phy-names = "usb";
++			status = "disabled";
++		};
++
++		ehci1: usb@f9930000 {
++			compatible = "generic-ehci";
++			reg = <0xf9930000 0x10000>;
++			interrupts = <GIC_SPI 62 IRQ_TYPE_LEVEL_HIGH>;
++			phys = <&usb2_phy 1>;
++			phy-names = "usb";
++			status = "disabled";
++		};
++
++		ohci1: usb@f9920000 {
++			compatible = "generic-ohci";
++			reg = <0xf9920000 0x10000>;
++			interrupts = <GIC_SPI 63 IRQ_TYPE_LEVEL_HIGH>;
++			phys = <&usb2_phy 1>;
++			phy-names = "usb";
++			status = "disabled";
++		};
++
++		/*
++		 * USB3: DWC3 core run as plain xHCI (stock kernel: hiusb-xhci, io f98a0000, GIC 101).
++		 * Glue replays the vendor clk-hiusb3.c sequence (CRG44 +0xb0, CRG101 +0x194, PERI_CTRL).
++		 */
++		usb3: usb3-glue@f98a0000 {
++			compatible = "hisilicon,hi3798mv100-usb3";
++			reg = <0xf98a0000 0x10000>, <0xf8a22000 0x1000>, <0xf8a20000 0x1000>;
++			#address-cells = <1>;
++			#size-cells = <1>;
++			ranges;
++			status = "disabled";
++
++			xhci: usb@f98a0000 {
++				compatible = "generic-xhci";
++				reg = <0xf98a0000 0x10000>;
++				interrupts = <GIC_SPI 69 IRQ_TYPE_LEVEL_HIGH>;
++			};
++		};
++
++		usb_otg: usb@f98c0000 {
++			compatible = "snps,dwc2";
++			reg = <0xf98c0000 0x40000>;
++			interrupts = <GIC_SPI 68 IRQ_TYPE_LEVEL_HIGH>;
++			clocks = <&clk_100m>;
++			clock-names = "otg";
++			dr_mode = "otg";
++			g-np-tx-fifo-size = <16>;
++			g-rx-fifo-size = <256>;
++			g-tx-fifo-size = <128 128 64>;
++			status = "disabled";
++		};
++
++
++
++		/*
++		 * Mali-450 MP2 (GP + 2 PP, PMU, broadcast), all IRQs on GIC 126 = SPI 94 (vendor
++		 * mali4xx platform). Glue enables CRG53 (+0xd4) clocks, pulses the GPU reset, runs the
++		 * vendor PMC setup and fixes the core clock (default 345.6 MHz, no devfreq: switching
++		 * the clock while a job runs hangs the GPU until reboot).
++		 */
++		gpu_glue: gpu-glue@f8a22000 {
++			compatible = "hisilicon,hi3798mv100-gpu-glue";
++			reg = <0xf8a22000 0x1000>, <0xf8a23000 0x1000>;
++			#clock-cells = <0>;
++			#address-cells = <1>;
++			#size-cells = <1>;
++			ranges;
++			status = "disabled";
++
++			mali: gpu@f9200000 {
++				compatible = "hisilicon,hi3798mv100-mali", "arm,mali-450";
++				reg = <0xf9200000 0x30000>;
++				interrupts = <GIC_SPI 94 IRQ_TYPE_LEVEL_HIGH>,
++					     <GIC_SPI 94 IRQ_TYPE_LEVEL_HIGH>,
++					     <GIC_SPI 94 IRQ_TYPE_LEVEL_HIGH>,
++					     <GIC_SPI 94 IRQ_TYPE_LEVEL_HIGH>,
++					     <GIC_SPI 94 IRQ_TYPE_LEVEL_HIGH>,
++					     <GIC_SPI 94 IRQ_TYPE_LEVEL_HIGH>,
++					     <GIC_SPI 94 IRQ_TYPE_LEVEL_HIGH>,
++					     <GIC_SPI 94 IRQ_TYPE_LEVEL_HIGH>;
++				interrupt-names = "gp", "gpmmu", "pp0", "ppmmu0", "pp1", "ppmmu1", "pp", "pmu";
++				clocks = <&clk_200m>, <&gpu_glue>;
++				clock-names = "bus", "core";
++				operating-points-v2 = <&gpu_opp_table>;
++				#cooling-cells = <2>;
++			};
++		};
++
++		gpu_opp_table: opp-table-gpu {
++			compatible = "operating-points-v2";
++
++			opp-200000000 { opp-hz = /bits/ 64 <200000000>; };
++			opp-250000000 { opp-hz = /bits/ 64 <250000000>; };
++			opp-300000000 { opp-hz = /bits/ 64 <300000000>; };
++			opp-345600000 { opp-hz = /bits/ 64 <345600000>; };
++			opp-375000000 { opp-hz = /bits/ 64 <375000000>; };
++			opp-400000000 { opp-hz = /bits/ 64 <400000000>; };
++			opp-432000000 { opp-hz = /bits/ 64 <432000000>; };
++		};
++
++		i2c0: i2c@f8b10000 {
++			#address-cells = <1>;
++			#size-cells = <0>;
++			compatible = "snps,designware-i2c";
++			reg = <0xf8b10000 0x1000>;
++			interrupts = <GIC_SPI 38 IRQ_TYPE_LEVEL_HIGH>;
++			clocks = <&clk_100m>;
++			clock-names = "pclk";
++			status = "disabled";
++		};
++
++		i2c1: i2c@f8b11000 {
++			#address-cells = <1>;
++			#size-cells = <0>;
++			compatible = "snps,designware-i2c";
++			reg = <0xf8b11000 0x1000>;
++			interrupts = <GIC_SPI 39 IRQ_TYPE_LEVEL_HIGH>;
++			clocks = <&clk_100m>;
++			clock-names = "pclk";
++			status = "disabled";
++		};
++
++		i2c2: i2c@f8b12000 {
++			#address-cells = <1>;
++			#size-cells = <0>;
++			compatible = "snps,designware-i2c";
++			reg = <0xf8b12000 0x1000>;
++			interrupts = <GIC_SPI 40 IRQ_TYPE_LEVEL_HIGH>;
++			clocks = <&clk_100m>;
++			clock-names = "pclk";
++			status = "disabled";
++		};
++
++		/*
++		 * IR receiver (vendor SDK DTS ir@f8001000, GIC 79). Clock gate/reset in
++		 * SC_CLKGATE_SRST_CTRL (SC+0x48) bit 4 en / bit 5 rst, 24 MHz (vendor clk-hiir.c);
++		 * ir-hix5hd2 drives that via the sysctrl regmap (socdata clk_reg 0x48).
++		 */
++		ir: ir@f8001000 {
++			compatible = "hisilicon,hix5hd2-ir";
++			reg = <0xf8001000 0x1000>;
++			interrupts = <GIC_SPI 47 IRQ_TYPE_LEVEL_HIGH>;
++			clocks = <&clk_24m>;
++			hisilicon,power-syscon = <&sysctrl>;
++			status = "disabled";
++		};
++
++		/*
++		 * TRNG (vendor SDK msp/drv/cipher, MV100 = old layout: CTRL +0, NUMBER +4,
++		 * STAT +8 count[2:0]); no clock gate. Same IP/address as Hi3798CV200.
++		 */
++		rng: rng@f8005000 {
++			compatible = "hisilicon,histb-rng";
++			reg = <0xf8005000 0x100>;
++		};
++
++		/*
++		 * SP805 watchdog (vendor WDG0). Verified: a second expiry hard-resets the
++		 * SoC (back to Fastboot). PrimeCell ID regs read 0. WDG1 @ f8a2d000 unused.
++		 */
++		watchdog: watchdog@f8a2c000 {
++			compatible = "arm,sp805", "arm,primecell";
++			arm,primecell-periphid = <0x00141805>;
++			reg = <0xf8a2c000 0x1000>;
++			clocks = <&clk_24m>, <&clk_24m>;
++			clock-names = "wdog_clk", "apb_pclk";
++			timeout-sec = <30>;
++		};
++
++		/*
++		 * SP804 timers as used by the vendor kernel: timer2 (f8a29000) is the
++		 * clocksource, timer4..7 are per-CPU local timers with one SPI each
++		 * (vendor GIC 58/91/59/92). 24 MHz. PrimeCell ID regs read 0.
++		 */
++		timer: timer@f8a29000 {
++			compatible = "hisilicon,hi3798mv100-timer";
++			reg = <0xf8a29000 0x20>,
++			      <0xf8a2a000 0x20>, <0xf8a2a020 0x20>,
++			      <0xf8a2b000 0x20>, <0xf8a2b020 0x20>;
++			interrupts = <GIC_SPI 26 IRQ_TYPE_LEVEL_HIGH>,
++				     <GIC_SPI 59 IRQ_TYPE_LEVEL_HIGH>,
++				     <GIC_SPI 27 IRQ_TYPE_LEVEL_HIGH>,
++				     <GIC_SPI 60 IRQ_TYPE_LEVEL_HIGH>;
++			clocks = <&clk_timer>;
++		};
++
++	};
++};
+diff --git a/arch/arm/boot/dts/hisilicon/hi3798mv100-bigfish.dts b/arch/arm/boot/dts/hisilicon/hi3798mv100-bigfish.dts
+new file mode 100644
+index 000000000..27fdb5319
+--- /dev/null
++++ b/arch/arm/boot/dts/hisilicon/hi3798mv100-bigfish.dts
+@@ -0,0 +1,135 @@
++// SPDX-License-Identifier: GPL-2.0-or-later
++/*
++ * Device tree for Hi3798Mv100 "bigfish" reference board
++ *
++ * Board: bigfish (G6O110SVT / HiSTBAndroidV600R001C00SPC062)
++ * SoC:   HiSilicon Hi3798Mv100 (quad Cortex-A7 @ 1.2GHz)
++ * RAM:   1GB DDR3
++ * Boot:  U-Boot Fastboot 3.3.0, kernel loaded at 0x02000000
++ */
++
++/dts-v1/;
++
++#include "hi3798mv100.dtsi"
++
++/ {
++	model = "HiSilicon Hi3798Mv100 Bigfish Board";
++	compatible = "hisilicon,hi3798mv100", "hisilicon,hi3798mv100-bigfish";
++
++	aliases {
++		serial0 = &uart0;
++		serial1 = &uart1;
++		serial2 = &uart2;
++		mmc0 = &mmc0;
++		mmc1 = &mmc1;
++		ethernet0 = &femac;
++	};
++
++	chosen {
++		#address-cells = <1>;
++		#size-cells = <1>;
++		ranges;
++		stdout-path = "serial0:115200n8";
++
++		/*
++		 * HDMI boot framebuffer set up by Fastboot (logo from the 'logo' partition, display
++		 * config from 'baseparam'): VDP HD graphics layer @ f8cc6800 scans out 0x3efd5000,
++		 * 1920x1080 ARGB8888, stride 0x1e0*16 = 7680 (read back from the live registers).
++		 */
++		framebuffer@3efd5000 {
++			compatible = "simple-framebuffer";
++			reg = <0x3efd5000 0x7e9000>;
++			width = <1920>;
++			height = <1080>;
++			stride = <7680>;
++			format = "a8r8g8b8";
++			memory-region = <&vdp_fastboot>;
++		};
++	};
++
++	memory@0 {
++		device_type = "memory";
++		reg = <0x00000000 0x40000000>;
++	};
++
++	reserved-memory {
++		#address-cells = <1>;
++		#size-cells = <1>;
++		ranges;
++
++		/*
++		 * Fastboot "Reserve Memory" area (0x3e357000..0x40000000): HD + SD graphics
++		 * framebuffers, VDP coefficient/parameter tables (VDP regs point at 0x3f7bf000..,
++		 * 0x3fd00000..), all still read by the display engine after handoff.
++		 */
++		vdp_fastboot: framebuffer@3e357000 {
++			reg = <0x3e357000 0x1ca9000>;
++			no-map;
++		};
++	};
++};
++
++&uart0 {
++	status = "okay";
++};
++
++&mmc0 {
++	status = "okay"; /* eMMC @ f9830000 (b30: was pointing at SD controller f9820000 with wrong IRQ) */
++};
++
++&gpu_glue {
++	status = "okay";
++};
++
++&usb3 {
++	status = "okay";
++};
++
++&mmc1 {
++	status = "okay";
++};
++
++&mdio0 {
++	status = "okay";
++};
++
++&femac {
++	status = "okay";
++	local-mac-address = [80 8c 97 42 50 34]; /* U-Boot env ethaddr */
++};
++
++&ehci0 {
++	status = "okay";
++};
++
++&ohci0 {
++	status = "okay";
++};
++
++&ehci1 {
++	status = "okay";
++};
++
++&ohci1 {
++	status = "okay";
++};
++
++&usb_otg {
++	status = "disabled"; /* GSNPSID reads 0x0 — controller absent or ungated on this board */
++};
++
++&i2c0 {
++	status = "disabled";
++};
++
++&i2c1 {
++	status = "disabled";
++};
++
++&i2c2 {
++	status = "disabled";
++};
++
++&ir {
++	status = "okay";
++};
+diff --git a/drivers/phy/hisilicon/phy-hi3798mv100-usb2.c b/drivers/phy/hisilicon/phy-hi3798mv100-usb2.c
+new file mode 100644
+index 000000000..d86996643
+--- /dev/null
++++ b/drivers/phy/hisilicon/phy-hi3798mv100-usb2.c
+@@ -0,0 +1,344 @@
++// SPDX-License-Identifier: GPL-2.0-or-later
++/*
++ * HiSilicon Hi3798MV100 USB2 host PHY / controller clock+reset glue.
++ *
++ * The INNO USB2 PHYs on this SoC are not memory mapped: they are clocked and
++ * reset through PERI_CRG46/47 (host0, 2-port PHY) and PERI_CRG100/102 (host1,
++ * 1-port PHY), and their internal registers are written through a bit-banged
++ * test interface in PERI_CTRL (PERI_USB1 / PERI_USB14).  Sequence taken from
++ * the HiSTBLinuxV100R005 SDK (drivers/hisilicon/clk/hi3798mx/clk-hiusb2.c),
++ * chipid & 0xf0 != 0x10 branch (SC_SYSID0 = 0x37980100 on the tested board).
++ *
++ * U-Boot runs "usb stop" before handing over, which leaves everything in
++ * reset, so Linux must replay the full sequence.
++ *
++ * #phy-cells = <1>: 0 = host0 (EHCI0 f9890000 / OHCI0 f9880000),
++ *                   1 = host1 (EHCI1 f9930000 / OHCI1 f9920000).
++ */
++
++#include <linux/bits.h>
++#include <linux/delay.h>
++#include <linux/io.h>
++#include <linux/mod_devicetable.h>
++#include <linux/module.h>
++#include <linux/mutex.h>
++#include <linux/phy/phy.h>
++#include <linux/platform_device.h>
++
++/* CRG (0xf8a22000) */
++#define PERI_CRG46_USB2CTRL	0x0b8
++#define PERI_CRG47_USB2PHY	0x0bc
++#define PERI_CRG100_USB2PHY2	0x190
++#define PERI_CRG102_USB2CTRL2	0x198
++
++/* PERI_CTRL (0xf8a20000) */
++#define PERI_USB0		0x120
++#define PERI_USB1		0x124
++#define PERI_USB13		0x154
++#define PERI_USB14		0x158
++
++/* PERI_CRG46 / PERI_CRG102 */
++#define USB2_BUS_CKEN		BIT(0)
++#define USB2_OHCI48M_CKEN	BIT(1)
++#define USB2_OHCI12M_CKEN	BIT(2)
++#define USB2_OTG_UTMI_CKEN	BIT(3)
++#define USB2_HST_PHY_CKEN	BIT(4)
++#define USB2_UTMI0_CKEN		BIT(5)
++#define USB2_UTMI1_CKEN		BIT(6)
++#define USB2_BUS_SRST_REQ	BIT(12)
++#define USB2_UTMI0_SRST_REQ	BIT(13)
++#define USB2_UTMI1_SRST_REQ	BIT(14)
++#define USB2_HST_PHY_SRST_REQ	BIT(16)
++#define USB2_OTG_PHY_SRST_REQ	BIT(17)
++
++#define HOST0_RESETS	(USB2_BUS_SRST_REQ | USB2_UTMI0_SRST_REQ | \
++			 USB2_UTMI1_SRST_REQ | USB2_HST_PHY_SRST_REQ | \
++			 USB2_OTG_PHY_SRST_REQ)
++#define HOST0_CLKS	(USB2_BUS_CKEN | USB2_OHCI48M_CKEN | USB2_OHCI12M_CKEN | \
++			 USB2_OTG_UTMI_CKEN | USB2_HST_PHY_CKEN | \
++			 USB2_UTMI0_CKEN | USB2_UTMI1_CKEN)
++/* host1 uses bit 14 for its only UTMI reset */
++#define HOST1_RESETS	(USB2_BUS_SRST_REQ | BIT(14) | USB2_HST_PHY_SRST_REQ)
++#define HOST1_CLKS	(USB2_BUS_CKEN | USB2_OHCI48M_CKEN | USB2_OHCI12M_CKEN | \
++			 USB2_HST_PHY_CKEN | USB2_UTMI0_CKEN)
++
++/* PERI_CRG47 */
++#define USB_PHY0_REF_CKEN	BIT(0)
++#define USB_PHY1_REF_CKEN	BIT(1)
++#define USB_PHY0_SRST_REQ	BIT(8)
++#define USB_PHY0_SRST_TREQ	BIT(9)
++#define USB_PHY1_SRST_REQ	BIT(10)
++#define USB_PHY1_SRST_TREQ	BIT(11)
++
++/* PERI_CRG100 */
++#define USB_PHY2_REF_CKEN	BIT(0)
++#define USB_PHY2_SRST_REQ	BIT(8)
++#define USB_PHY2_SRST_TREQ	BIT(9)
++
++/* PERI_USB0 / PERI_USB13 */
++#define WORDINTERFACE		BIT(0)
++#define ULPI_BYPASS_EN_PORT0	BIT(3)
++#define SS_BURST16_EN		BIT(9)
++
++/* PERI_USB1 / PERI_USB14 test interface: [7:0] data, [12:8] addr */
++#define TEST_WREN		BIT(13)
++#define TEST_CLK		BIT(14)
++#define TEST_RSTN		BIT(15)
++
++struct hi3798mv100_usb2 {
++	void __iomem *crg;
++	void __iomem *peri;
++	struct mutex lock;
++};
++
++struct hi3798mv100_usb2_port {
++	struct hi3798mv100_usb2 *priv;
++	unsigned int host;
++};
++
++static void rmw(void __iomem *reg, u32 clr, u32 set)
++{
++	writel((readl(reg) & ~clr) | set, reg);
++}
++
++/* Clock one byte into the PHY's test interface: addr/data are pre-encoded. */
++static void test_write(void __iomem *reg, u32 addr_data)
++{
++	u32 v = TEST_RSTN | TEST_WREN | addr_data;
++
++	writel(v, reg);
++	writel(v | TEST_CLK, reg);
++	writel(v, reg);
++}
++
++static void host0_init(struct hi3798mv100_usb2 *p)
++{
++	void __iomem *crg46 = p->crg + PERI_CRG46_USB2CTRL;
++	void __iomem *crg47 = p->crg + PERI_CRG47_USB2PHY;
++	void __iomem *tst = p->peri + PERI_USB1;
++
++	rmw(crg46, 0, HOST0_RESETS);
++	udelay(200);
++	rmw(crg47, 0, USB_PHY0_SRST_REQ | USB_PHY1_SRST_REQ |
++		      USB_PHY0_SRST_TREQ | USB_PHY1_SRST_TREQ);
++	udelay(200);
++
++	/* UTMI, 8-bit interface, no 16-beat bursts */
++	rmw(p->peri + PERI_USB0, WORDINTERFACE | SS_BURST16_EN,
++	    ULPI_BYPASS_EN_PORT0);
++	udelay(100);
++
++	rmw(crg47, 0, USB_PHY0_REF_CKEN | USB_PHY1_REF_CKEN);
++	udelay(300);
++
++	test_write(tst, 0x0809);	/* PLL core clock 240M */
++	udelay(300);
++
++	/* release PHY power-on reset */
++	rmw(crg47, USB_PHY0_SRST_REQ | USB_PHY1_SRST_REQ, 0);
++	udelay(300);
++
++	/* "avoid inno phy error" */
++	test_write(tst, 0x073b);
++	udelay(500);
++	test_write(tst, 0x0bc0);
++	udelay(500);
++	test_write(tst, 0x073f);
++	mdelay(1);
++	test_write(tst, 0x0be0);
++	mdelay(1);
++	/* 2-port PHY disconnect fix */
++	test_write(tst, 0x0a02);
++	test_write(tst, 0x1a1e);
++	udelay(500);
++	test_write(tst, 0x0801);	/* PLL core clock 480M */
++	udelay(300);
++
++	/* release port resets, let the comp circuit settle */
++	rmw(crg47, USB_PHY0_SRST_TREQ | USB_PHY1_SRST_TREQ, 0);
++	mdelay(2);
++
++	rmw(crg46, HOST0_RESETS, HOST0_CLKS);
++	udelay(200);
++}
++
++static void host0_exit(struct hi3798mv100_usb2 *p)
++{
++	rmw(p->crg + PERI_CRG47_USB2PHY, 0,
++	    USB_PHY0_SRST_REQ | USB_PHY1_SRST_REQ |
++	    USB_PHY0_SRST_TREQ | USB_PHY1_SRST_TREQ);
++	udelay(100);
++	rmw(p->crg + PERI_CRG46_USB2CTRL,
++	    USB2_BUS_CKEN | USB2_HST_PHY_CKEN | USB2_UTMI0_CKEN |
++	    USB2_UTMI1_CKEN, 0);
++	udelay(200);
++}
++
++static void host1_init(struct hi3798mv100_usb2 *p)
++{
++	void __iomem *crg100 = p->crg + PERI_CRG100_USB2PHY2;
++	void __iomem *crg102 = p->crg + PERI_CRG102_USB2CTRL2;
++	void __iomem *tst = p->peri + PERI_USB14;
++
++	rmw(crg102, 0, HOST1_RESETS);
++	udelay(200);
++	rmw(crg100, 0, USB_PHY2_SRST_REQ | USB_PHY2_SRST_TREQ);
++	udelay(200);
++
++	rmw(p->peri + PERI_USB13, WORDINTERFACE | SS_BURST16_EN,
++	    ULPI_BYPASS_EN_PORT0);
++	udelay(100);
++
++	rmw(crg100, 0, USB_PHY2_REF_CKEN);
++	udelay(300);
++
++	test_write(tst, 0x0809);	/* PLL core clock 240M */
++	udelay(300);
++
++	rmw(crg100, USB_PHY2_SRST_REQ, 0);
++	mdelay(2);
++
++	test_write(tst, 0x0801);	/* PLL core clock 480M */
++	udelay(300);
++
++	/* config clk output */
++	writel(TEST_RSTN | TEST_WREN | 0x060c, tst);
++	udelay(500);
++	writel(TEST_RSTN | TEST_WREN | TEST_CLK | 0x060c, tst);
++	udelay(500);
++	writel(TEST_RSTN | TEST_WREN | 0x060c, tst);
++	mdelay(10);
++
++	/* 1-port PHY disconnect fix */
++	test_write(tst, 0x0a02);
++	udelay(500);
++
++	rmw(crg100, USB_PHY2_SRST_TREQ, 0);
++	mdelay(2);
++
++	rmw(crg102, HOST1_RESETS, HOST1_CLKS);
++	udelay(200);
++}
++
++static void host1_exit(struct hi3798mv100_usb2 *p)
++{
++	rmw(p->crg + PERI_CRG102_USB2CTRL2, 0, HOST1_RESETS);
++	udelay(200);
++	rmw(p->crg + PERI_CRG100_USB2PHY2, 0,
++	    USB_PHY2_SRST_REQ | USB_PHY2_SRST_TREQ);
++	udelay(100);
++}
++
++static int hi3798mv100_usb2_init(struct phy *phy)
++{
++	struct hi3798mv100_usb2_port *port = phy_get_drvdata(phy);
++
++	mutex_lock(&port->priv->lock);
++	if (port->host == 0)
++		host0_init(port->priv);
++	else
++		host1_init(port->priv);
++	mutex_unlock(&port->priv->lock);
++
++	return 0;
++}
++
++static int hi3798mv100_usb2_exit(struct phy *phy)
++{
++	struct hi3798mv100_usb2_port *port = phy_get_drvdata(phy);
++
++	mutex_lock(&port->priv->lock);
++	if (port->host == 0)
++		host0_exit(port->priv);
++	else
++		host1_exit(port->priv);
++	mutex_unlock(&port->priv->lock);
++
++	return 0;
++}
++
++static const struct phy_ops hi3798mv100_usb2_ops = {
++	.init	= hi3798mv100_usb2_init,
++	.exit	= hi3798mv100_usb2_exit,
++	.owner	= THIS_MODULE,
++};
++
++static struct phy *hi3798mv100_usb2_xlate(struct device *dev,
++					  struct of_phandle_args *args)
++{
++	struct phy **phys = dev_get_drvdata(dev);
++
++	if (args->args_count != 1 || args->args[0] > 1)
++		return ERR_PTR(-EINVAL);
++
++	return phys[args->args[0]];
++}
++
++static int hi3798mv100_usb2_probe(struct platform_device *pdev)
++{
++	struct device *dev = &pdev->dev;
++	struct hi3798mv100_usb2 *priv;
++	struct phy_provider *provider;
++	struct phy **phys;
++	struct resource *res;
++	unsigned int i;
++
++	priv = devm_kzalloc(dev, sizeof(*priv), GFP_KERNEL);
++	phys = devm_kcalloc(dev, 2, sizeof(*phys), GFP_KERNEL);
++	if (!priv || !phys)
++		return -ENOMEM;
++	mutex_init(&priv->lock);
++
++	/*
++	 * CRG and PERI_CTRL are shared with other (future) drivers: map
++	 * without claiming the regions.
++	 */
++	res = platform_get_resource(pdev, IORESOURCE_MEM, 0);
++	if (!res)
++		return -EINVAL;
++	priv->crg = devm_ioremap(dev, res->start, resource_size(res));
++	res = platform_get_resource(pdev, IORESOURCE_MEM, 1);
++	if (!res)
++		return -EINVAL;
++	priv->peri = devm_ioremap(dev, res->start, resource_size(res));
++	if (!priv->crg || !priv->peri)
++		return -ENOMEM;
++
++	for (i = 0; i < 2; i++) {
++		struct hi3798mv100_usb2_port *port;
++
++		port = devm_kzalloc(dev, sizeof(*port), GFP_KERNEL);
++		if (!port)
++			return -ENOMEM;
++		port->priv = priv;
++		port->host = i;
++
++		phys[i] = devm_phy_create(dev, NULL, &hi3798mv100_usb2_ops);
++		if (IS_ERR(phys[i]))
++			return PTR_ERR(phys[i]);
++		phy_set_drvdata(phys[i], port);
++	}
++
++	dev_set_drvdata(dev, phys);
++	provider = devm_of_phy_provider_register(dev, hi3798mv100_usb2_xlate);
++
++	return PTR_ERR_OR_ZERO(provider);
++}
++
++static const struct of_device_id hi3798mv100_usb2_of_match[] = {
++	{ .compatible = "hisilicon,hi3798mv100-usb2-host-phy" },
++	{ }
++};
++MODULE_DEVICE_TABLE(of, hi3798mv100_usb2_of_match);
++
++static struct platform_driver hi3798mv100_usb2_driver = {
++	.probe	= hi3798mv100_usb2_probe,
++	.driver	= {
++		.name		= "hi3798mv100-usb2-phy",
++		.of_match_table	= hi3798mv100_usb2_of_match,
++	},
++};
++module_platform_driver(hi3798mv100_usb2_driver);
++
++MODULE_DESCRIPTION("HiSilicon Hi3798MV100 USB2 host PHY");
++MODULE_LICENSE("GPL");
+diff --git a/drivers/clocksource/timer-hi3798mv100.c b/drivers/clocksource/timer-hi3798mv100.c
+new file mode 100644
+index 000000000..01e0147fd
+--- /dev/null
++++ b/drivers/clocksource/timer-hi3798mv100.c
+@@ -0,0 +1,235 @@
++// SPDX-License-Identifier: GPL-2.0-or-later
++/*
++ * HiSilicon Hi3798MV100 timers.
++ *
++ * The SoC has four dual-channel SP804 blocks but no usable ARM generic timer
++ * (CNTVCT reads garbage) and no per-CPU private timer, so the vendor kernel
++ * (HiSTB SDK "hisilicon,timer") uses:
++ *   - timer2 (0xf8a29000) as free-running clocksource / sched_clock,
++ *   - one SP804 channel per CPU as local clock_event_device, each with its
++ *     own SPI that is routed to that CPU only:
++ *       cpu0 timer4 f8a2a000 SPI 26, cpu1 timer5 f8a2a020 SPI 59,
++ *       cpu2 timer6 f8a2b000 SPI 27, cpu3 timer7 f8a2b020 SPI 60.
++ *
++ * DT: reg = <clocksource>, <local0>..<localN-1>; interrupts = <local0>..;
++ *     clocks = <24 MHz timer clock>.
++ */
++
++#define pr_fmt(fmt) "hi3798mv100-timer: " fmt
++
++#include <linux/clk.h>
++#include <linux/clockchips.h>
++#include <linux/clocksource.h>
++#include <linux/cpu.h>
++#include <linux/cpuhotplug.h>
++#include <linux/interrupt.h>
++#include <linux/io.h>
++#include <linux/irq.h>
++#include <linux/of.h>
++#include <linux/of_address.h>
++#include <linux/of_irq.h>
++#include <linux/percpu.h>
++#include <linux/sched_clock.h>
++#include <linux/slab.h>
++
++#include <asm/delay.h>
++
++/* SP804 channel registers */
++#define TIMER_LOAD		0x00
++#define TIMER_VALUE		0x04
++#define TIMER_CTRL		0x08
++#define  TIMER_CTRL_ONESHOT	BIT(0)
++#define  TIMER_CTRL_32BIT	BIT(1)
++#define  TIMER_CTRL_IE		BIT(5)
++#define  TIMER_CTRL_PERIODIC	BIT(6)
++#define  TIMER_CTRL_ENABLE	BIT(7)
++#define TIMER_INTCLR		0x0c
++#define TIMER_BGLOAD		0x18
++
++#define HI3798_MAX_CPUS		4
++
++struct hi3798_local_timer {
++	struct clock_event_device evt;
++	void __iomem *base;
++	unsigned long reload;
++	int irq;
++	char name[16];
++};
++
++static struct hi3798_local_timer hi3798_timers[HI3798_MAX_CPUS];
++static unsigned int hi3798_nr_local;
++static unsigned long hi3798_rate;
++static void __iomem *hi3798_cs_base;
++
++static inline struct hi3798_local_timer *to_lt(struct clock_event_device *evt)
++{
++	return container_of(evt, struct hi3798_local_timer, evt);
++}
++
++static void lt_disable(struct hi3798_local_timer *lt)
++{
++	writel_relaxed(0, lt->base + TIMER_CTRL);
++	writel_relaxed(1, lt->base + TIMER_INTCLR);
++}
++
++static int lt_shutdown(struct clock_event_device *evt)
++{
++	lt_disable(to_lt(evt));
++	return 0;
++}
++
++static int lt_set_periodic(struct clock_event_device *evt)
++{
++	struct hi3798_local_timer *lt = to_lt(evt);
++
++	lt_disable(lt);
++	writel_relaxed(lt->reload, lt->base + TIMER_LOAD);
++	writel_relaxed(TIMER_CTRL_32BIT | TIMER_CTRL_IE | TIMER_CTRL_PERIODIC |
++		       TIMER_CTRL_ENABLE, lt->base + TIMER_CTRL);
++	return 0;
++}
++
++static int lt_set_next_event(unsigned long next, struct clock_event_device *evt)
++{
++	struct hi3798_local_timer *lt = to_lt(evt);
++
++	writel_relaxed(0, lt->base + TIMER_CTRL);
++	writel_relaxed(next, lt->base + TIMER_LOAD);
++	writel_relaxed(TIMER_CTRL_32BIT | TIMER_CTRL_IE | TIMER_CTRL_ONESHOT |
++		       TIMER_CTRL_ENABLE, lt->base + TIMER_CTRL);
++	return 0;
++}
++
++static irqreturn_t lt_interrupt(int irq, void *dev_id)
++{
++	struct hi3798_local_timer *lt = dev_id;
++
++	writel_relaxed(1, lt->base + TIMER_INTCLR);
++	lt->evt.event_handler(&lt->evt);
++	return IRQ_HANDLED;
++}
++
++static int hi3798_timer_starting_cpu(unsigned int cpu)
++{
++	struct hi3798_local_timer *lt;
++
++	if (cpu >= hi3798_nr_local)
++		return 0;
++	lt = &hi3798_timers[cpu];
++
++	lt_disable(lt);
++	irq_force_affinity(lt->irq, cpumask_of(cpu));
++	enable_irq(lt->irq);
++
++	lt->evt.cpumask = cpumask_of(cpu);
++	clockevents_config_and_register(&lt->evt, hi3798_rate, 0xf, 0xffffffff);
++	return 0;
++}
++
++static int hi3798_timer_dying_cpu(unsigned int cpu)
++{
++	struct hi3798_local_timer *lt;
++
++	if (cpu >= hi3798_nr_local)
++		return 0;
++	lt = &hi3798_timers[cpu];
++
++	lt_disable(lt);
++	disable_irq_nosync(lt->irq);
++	return 0;
++}
++
++static u64 notrace hi3798_sched_read(void)
++{
++	return ~readl_relaxed(hi3798_cs_base + TIMER_VALUE);
++}
++
++/* udelay() from the 24 MHz counter: independent of the CPU clock (which we change) */
++static unsigned long hi3798_delay_read(void)
++{
++	return ~readl_relaxed(hi3798_cs_base + TIMER_VALUE);
++}
++
++static struct delay_timer hi3798_delay_timer = {
++	.read_current_timer = hi3798_delay_read,
++};
++
++static int __init hi3798_timer_init(struct device_node *np)
++{
++	struct clk *clk;
++	unsigned int i;
++	int ret;
++
++	clk = of_clk_get(np, 0);
++	if (IS_ERR(clk)) {
++		pr_err("no clock\n");
++		return PTR_ERR(clk);
++	}
++	ret = clk_prepare_enable(clk);
++	if (ret)
++		return ret;
++	hi3798_rate = clk_get_rate(clk);
++	if (!hi3798_rate)
++		return -EINVAL;
++
++	/* clocksource: free-running down-counter */
++	hi3798_cs_base = of_iomap(np, 0);
++	if (!hi3798_cs_base)
++		return -ENXIO;
++	writel_relaxed(0, hi3798_cs_base + TIMER_CTRL);
++	writel_relaxed(0xffffffff, hi3798_cs_base + TIMER_LOAD);
++	writel_relaxed(0xffffffff, hi3798_cs_base + TIMER_VALUE);
++	writel_relaxed(TIMER_CTRL_32BIT | TIMER_CTRL_ENABLE | TIMER_CTRL_PERIODIC,
++		       hi3798_cs_base + TIMER_CTRL);
++	clocksource_mmio_init(hi3798_cs_base + TIMER_VALUE, "hi3798-timer",
++			      hi3798_rate, 300, 32, clocksource_mmio_readl_down);
++	sched_clock_register(hi3798_sched_read, 32, hi3798_rate);
++	hi3798_delay_timer.freq = hi3798_rate;
++	register_current_timer_delay(&hi3798_delay_timer);
++
++	/* local timers */
++	for (i = 0; i < HI3798_MAX_CPUS && i < num_possible_cpus(); i++) {
++		struct hi3798_local_timer *lt = &hi3798_timers[i];
++
++		lt->base = of_iomap(np, i + 1);
++		lt->irq = irq_of_parse_and_map(np, i);
++		if (!lt->base || !lt->irq) {
++			pr_err("local timer %u: missing reg/irq\n", i);
++			return -EINVAL;
++		}
++		lt_disable(lt);
++		lt->reload = DIV_ROUND_CLOSEST(hi3798_rate, HZ);
++
++		snprintf(lt->name, sizeof(lt->name), "local_timer%u", i);
++		lt->evt.name = lt->name;
++		lt->evt.features = CLOCK_EVT_FEAT_PERIODIC | CLOCK_EVT_FEAT_ONESHOT;
++		lt->evt.rating = 350;
++		lt->evt.irq = lt->irq;
++		lt->evt.set_state_shutdown = lt_shutdown;
++		lt->evt.set_state_oneshot_stopped = lt_shutdown;
++		lt->evt.set_state_periodic = lt_set_periodic;
++		lt->evt.set_next_event = lt_set_next_event;
++		lt->evt.tick_resume = lt_shutdown;
++
++		irq_set_status_flags(lt->irq, IRQ_NOAUTOEN);
++		ret = request_irq(lt->irq, lt_interrupt,
++				  IRQF_TIMER | IRQF_NOBALANCING, lt->name, lt);
++		if (ret) {
++			pr_err("local timer %u: request_irq %d failed\n", i, lt->irq);
++			return ret;
++		}
++		hi3798_nr_local = i + 1;
++	}
++
++	ret = cpuhp_setup_state(CPUHP_AP_HI3798_TIMER_STARTING,
++				"clockevents/hi3798mv100:starting",
++				hi3798_timer_starting_cpu,
++				hi3798_timer_dying_cpu);
++	if (ret)
++		return ret;
++
++	pr_info("clocksource + %u local timers @ %lu Hz\n", hi3798_nr_local,
++		hi3798_rate);
++	return 0;
++}
++TIMER_OF_DECLARE(hi3798mv100, "hisilicon,hi3798mv100-timer", hi3798_timer_init);
+diff --git a/drivers/thermal/hi3798mv100_thermal.c b/drivers/thermal/hi3798mv100_thermal.c
+new file mode 100644
+index 000000000..11154d678
+--- /dev/null
++++ b/drivers/thermal/hi3798mv100_thermal.c
+@@ -0,0 +1,76 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * Hi3798MV100 on-die temperature sensor.
++ *
++ * Decoded from the stock 3.10 kernel (mpu_get_temperature): writing
++ * 0x07200000 to PMC10 starts continuous sampling, PMC12/PMC13 hold the last
++ * eight 8-bit samples, T[degC] = avg * 180 / 255 - 40.
++ */
++#include <linux/io.h>
++#include <linux/module.h>
++#include <linux/of.h>
++#include <linux/platform_device.h>
++#include <linux/thermal.h>
++
++#include "thermal_hwmon.h"
++
++#define TSENSOR_CTRL		0x0	/* PMC10 */
++#define TSENSOR_VAL0		0x8	/* PMC12 */
++#define TSENSOR_VAL1		0xc	/* PMC13 */
++#define TSENSOR_ENABLE		0x07200000
++
++static int hi3798mv100_tsensor_get_temp(struct thermal_zone_device *tz, int *temp)
++{
++	void __iomem *base = thermal_zone_device_priv(tz);
++	u32 v[2] = { readl_relaxed(base + TSENSOR_VAL0), readl_relaxed(base + TSENSOR_VAL1) };
++	u32 sum = 0;
++	int i;
++
++	for (i = 0; i < 4; i++)
++		sum += ((v[0] >> (8 * i)) & 0xff) + ((v[1] >> (8 * i)) & 0xff);
++
++	/* sum of 8 samples: T = sum/8 * 180/255 - 40 (millidegrees) */
++	*temp = (int)(sum * 180000U / (255U * 8U)) - 40000;
++	return 0;
++}
++
++static const struct thermal_zone_device_ops hi3798mv100_tsensor_ops = {
++	.get_temp = hi3798mv100_tsensor_get_temp,
++};
++
++static int hi3798mv100_tsensor_probe(struct platform_device *pdev)
++{
++	struct thermal_zone_device *tz;
++	void __iomem *base;
++
++	base = devm_platform_ioremap_resource(pdev, 0);
++	if (IS_ERR(base))
++		return PTR_ERR(base);
++
++	writel_relaxed(TSENSOR_ENABLE, base + TSENSOR_CTRL);
++
++	tz = devm_thermal_of_zone_register(&pdev->dev, 0, base, &hi3798mv100_tsensor_ops);
++	if (IS_ERR(tz))
++		return dev_err_probe(&pdev->dev, PTR_ERR(tz), "failed to register thermal zone\n");
++
++	devm_thermal_add_hwmon_sysfs(&pdev->dev, tz);
++	return 0;
++}
++
++static const struct of_device_id hi3798mv100_tsensor_of_match[] = {
++	{ .compatible = "hisilicon,hi3798mv100-tsensor" },
++	{ }
++};
++MODULE_DEVICE_TABLE(of, hi3798mv100_tsensor_of_match);
++
++static struct platform_driver hi3798mv100_tsensor_driver = {
++	.probe = hi3798mv100_tsensor_probe,
++	.driver = {
++		.name = "hi3798mv100-tsensor",
++		.of_match_table = hi3798mv100_tsensor_of_match,
++	},
++};
++module_platform_driver(hi3798mv100_tsensor_driver);
++
++MODULE_DESCRIPTION("Hi3798MV100 temperature sensor");
++MODULE_LICENSE("GPL");
+diff --git a/drivers/cpufreq/hi3798mv100-cpufreq.c b/drivers/cpufreq/hi3798mv100-cpufreq.c
+new file mode 100644
+index 000000000..0ca04d8ad
+--- /dev/null
++++ b/drivers/cpufreq/hi3798mv100-cpufreq.c
+@@ -0,0 +1,94 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * Hi3798MV100 CPU frequency switching via the CPU_LP mux (CRG + 0x48).
++ *
++ * The mux selects fixed PLL outputs (0 APLL, 1 800 MHz, 3 1.5 GHz, 4 24 MHz,
++ * 5 1.2 GHz, 6 400 MHz, 7 600 MHz); all four cores share it. Switch sequence
++ * as in U-Boot: write sel|0x300, then sel|0x700. Voltage stays as U-Boot's
++ * AVS set it. 400 MHz is deliberately absent (the vendor's 400 MHz dance broke
++ * femac RX). Registered as cooling device for the T-sensor thermal zone.
++ */
++#include <linux/cpufreq.h>
++#include <linux/io.h>
++#include <linux/module.h>
++#include <linux/of.h>
++#include <linux/platform_device.h>
++
++#define CPU_LP_SEL_MASK		0x7
++
++static void __iomem *cpu_lp;
++
++static struct cpufreq_frequency_table hi3798mv100_freqs[] = {
++	{ .driver_data = 1, .frequency = 800000 },
++	{ .driver_data = 5, .frequency = 1200000 },
++	{ .frequency = CPUFREQ_TABLE_END },
++};
++
++static int hi3798mv100_cpufreq_target(struct cpufreq_policy *policy, unsigned int index)
++{
++	u32 sel = hi3798mv100_freqs[index].driver_data;
++
++	writel_relaxed(0x300 | sel, cpu_lp);
++	writel_relaxed(0x700 | sel, cpu_lp);
++	return 0;
++}
++
++static unsigned int hi3798mv100_cpufreq_get(unsigned int cpu)
++{
++	u32 sel = readl_relaxed(cpu_lp) & CPU_LP_SEL_MASK;
++	struct cpufreq_frequency_table *f;
++
++	cpufreq_for_each_entry(f, hi3798mv100_freqs)
++		if (f->driver_data == sel)
++			return f->frequency;
++	return 0;
++}
++
++static int hi3798mv100_cpufreq_init(struct cpufreq_policy *policy)
++{
++	cpufreq_generic_init(policy, hi3798mv100_freqs, 100 * NSEC_PER_USEC);
++	return 0;
++}
++
++static struct cpufreq_driver hi3798mv100_cpufreq_driver = {
++	.name		= "hi3798mv100",
++	.flags		= CPUFREQ_NEED_INITIAL_FREQ_CHECK | CPUFREQ_IS_COOLING_DEV,
++	.verify		= cpufreq_generic_frequency_table_verify,
++	.target_index	= hi3798mv100_cpufreq_target,
++	.get		= hi3798mv100_cpufreq_get,
++	.init		= hi3798mv100_cpufreq_init,
++	.attr		= cpufreq_generic_attr,
++};
++
++static int hi3798mv100_cpufreq_probe(struct platform_device *pdev)
++{
++	cpu_lp = devm_platform_ioremap_resource(pdev, 0);
++	if (IS_ERR(cpu_lp))
++		return PTR_ERR(cpu_lp);
++
++	return cpufreq_register_driver(&hi3798mv100_cpufreq_driver);
++}
++
++static void hi3798mv100_cpufreq_remove(struct platform_device *pdev)
++{
++	cpufreq_unregister_driver(&hi3798mv100_cpufreq_driver);
++}
++
++static const struct of_device_id hi3798mv100_cpufreq_of_match[] = {
++	{ .compatible = "hisilicon,hi3798mv100-cpuctrl" },
++	{ }
++};
++MODULE_DEVICE_TABLE(of, hi3798mv100_cpufreq_of_match);
++
++static struct platform_driver hi3798mv100_cpufreq_platdrv = {
++	.probe = hi3798mv100_cpufreq_probe,
++	.remove_new = hi3798mv100_cpufreq_remove,
++	.driver = {
++		.name = "hi3798mv100-cpufreq",
++		.of_match_table = hi3798mv100_cpufreq_of_match,
++	},
++};
++module_platform_driver(hi3798mv100_cpufreq_platdrv);
++
++MODULE_DESCRIPTION("Hi3798MV100 CPU frequency driver");
++MODULE_LICENSE("GPL");
+diff --git a/drivers/usb/host/xhci-hi3798mv100.c b/drivers/usb/host/xhci-hi3798mv100.c
+new file mode 100644
+index 000000000..c7c3d9c92
+--- /dev/null
++++ b/drivers/usb/host/xhci-hi3798mv100.c
+@@ -0,0 +1,131 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * Hi3798MV100 USB3 (DWC3 core used as plain xHCI) bring-up glue.
++ *
++ * Replays the vendor 3.18 SDK clk-hiusb3.c enable sequence (CRG44 controller
++ * clocks/reset, CRG101 USB3 PHY resets, PERI_CTRL isolation, a few DWC3
++ * global registers), then populates the generic-xhci child node.
++ *
++ * reg: <xhci/dwc3 regs>, <CRG>, <PERI_CTRL>  (mapped without request: the
++ * child and other drivers own these ranges too).
++ */
++#include <linux/delay.h>
++#include <linux/io.h>
++#include <linux/module.h>
++#include <linux/of.h>
++#include <linux/of_platform.h>
++#include <linux/platform_device.h>
++
++#define PERI_CTRL		0x0008
++#define  USB3_IP_ISO_CTRL	BIT(26)
++#define PERI_CTRL_USB6		0x0138
++
++#define CRG44_USB3CTRL		0x00b0
++#define  USB3_VCC_SRST_REQ	BIT(12)
++#define  USB3_CLKS		(BIT(4) | BIT(2) | BIT(1) | BIT(0))
++#define CRG101_USB3PHY		0x0194
++#define  USB3_PHY_SRST_REQ	BIT(4)
++#define  USB3_PHY_SRST_TREQ	BIT(5)
++
++#define GTXTHRCFG		0xc108
++#define GRXTHRCFG		0xc10c
++#define GCTL			0xc110
++#define GUSB2PHYCFG0		0xc200
++#define  UTMI_8_16		BIT(3)
++#define  UTMI_ULPI		BIT(4)
++#define GUSB3PIPECTL0		0xc2c0
++#define  PIPE_SUSPHY		BIT(17)
++#define  PCS_SSP_SOFT_RESET	BIT(31)
++
++struct hi3798mv100_usb3 {
++	void __iomem *xhci, *crg, *peri;
++};
++
++static void __iomem *map_idx(struct platform_device *pdev, int i)
++{
++	struct resource *res = platform_get_resource(pdev, IORESOURCE_MEM, i);
++
++	if (!res)
++		return IOMEM_ERR_PTR(-EINVAL);
++	return devm_ioremap(&pdev->dev, res->start, resource_size(res)) ?: IOMEM_ERR_PTR(-ENOMEM);
++}
++
++static void rmw(void __iomem *a, u32 clr, u32 set)
++{
++	writel((readl(a) & ~clr) | set, a);
++}
++
++static void hi3798mv100_usb3_enable(struct hi3798mv100_usb3 *u)
++{
++	rmw(u->peri + PERI_CTRL, USB3_IP_ISO_CTRL, 0);
++
++	writel(0x431, u->crg + CRG101_USB3PHY);
++	writel(0x13ff, u->crg + CRG44_USB3CTRL);
++	mdelay(5);
++	rmw(u->crg + CRG44_USB3CTRL, USB3_VCC_SRST_REQ, 0);
++	mdelay(5);
++
++	rmw(u->xhci + GUSB3PIPECTL0, 0, PCS_SSP_SOFT_RESET);
++	rmw(u->xhci + GUSB2PHYCFG0, UTMI_ULPI | UTMI_8_16, 0);
++	mdelay(1);
++	rmw(u->xhci + GCTL, 0x3 << 12, 0x1 << 12);	/* host mode */
++
++	rmw(u->crg + CRG101_USB3PHY, USB3_PHY_SRST_REQ, 0);
++	mdelay(5);
++	rmw(u->crg + CRG101_USB3PHY, USB3_PHY_SRST_TREQ, 0);
++
++	rmw(u->xhci + GUSB3PIPECTL0, PIPE_SUSPHY | PCS_SSP_SOFT_RESET, 0);
++	mdelay(5);
++
++	writel(0x23100000, u->xhci + GTXTHRCFG);
++	writel(0x23100000, u->xhci + GRXTHRCFG);
++	mdelay(1);
++
++	writel(0x7381560d, u->peri + PERI_CTRL_USB6);	/* USB3 eye config */
++}
++
++static int hi3798mv100_usb3_probe(struct platform_device *pdev)
++{
++	struct hi3798mv100_usb3 *u;
++
++	u = devm_kzalloc(&pdev->dev, sizeof(*u), GFP_KERNEL);
++	if (!u)
++		return -ENOMEM;
++	u->xhci = map_idx(pdev, 0);
++	u->crg = map_idx(pdev, 1);
++	u->peri = map_idx(pdev, 2);
++	if (IS_ERR(u->xhci) || IS_ERR(u->crg) || IS_ERR(u->peri))
++		return -ENOMEM;
++
++	platform_set_drvdata(pdev, u);
++	hi3798mv100_usb3_enable(u);
++	dev_info(&pdev->dev, "USB3 up, GSNPSID %08x\n", readl(u->xhci + 0xc120));
++
++	return devm_of_platform_populate(&pdev->dev);
++}
++
++static void hi3798mv100_usb3_remove(struct platform_device *pdev)
++{
++	struct hi3798mv100_usb3 *u = platform_get_drvdata(pdev);
++
++	rmw(u->crg + CRG44_USB3CTRL, USB3_CLKS, 0);
++}
++
++static const struct of_device_id hi3798mv100_usb3_of_match[] = {
++	{ .compatible = "hisilicon,hi3798mv100-usb3" },
++	{ }
++};
++MODULE_DEVICE_TABLE(of, hi3798mv100_usb3_of_match);
++
++static struct platform_driver hi3798mv100_usb3_driver = {
++	.probe = hi3798mv100_usb3_probe,
++	.remove_new = hi3798mv100_usb3_remove,
++	.driver = {
++		.name = "hi3798mv100-usb3",
++		.of_match_table = hi3798mv100_usb3_of_match,
++	},
++};
++module_platform_driver(hi3798mv100_usb3_driver);
++
++MODULE_DESCRIPTION("Hi3798MV100 USB3 glue");
++MODULE_LICENSE("GPL");
+diff --git a/drivers/soc/hisilicon/hi3798mv100-gpu.c b/drivers/soc/hisilicon/hi3798mv100-gpu.c
+new file mode 100644
+index 000000000..b3593fb8f
+--- /dev/null
++++ b/drivers/soc/hisilicon/hi3798mv100-gpu.c
+@@ -0,0 +1,186 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * Hi3798MV100 Mali-450 MP2 bring-up glue.
++ *
++ * From the vendor SDK msp/drv/gpu/mali4xx/platform/mali450/mali4xx_clk.c:
++ * PERI_CRG53 (CRG + 0xd4): bit 0 GPU clock, bits 8..10 PP clocks, bit 4 GPU
++ * soft reset. U-Boot leaves 0x10 (in reset, clocks off). Enable the clocks,
++ * pulse the reset, then populate the lima child node.
++ *
++ * Also provides the GPU core clock (#clock-cells = <0>): CRG + 0x124 bits
++ * [2:0] select the rate, the switch is requested through PMC21 (+0x54):
++ * bit 18 = trend (1 up), bit 21 = request pulse. GPU voltage is the shared
++ * core rail, which the vendor driver never changes on this chip.
++ */
++#include <linux/clk-provider.h>
++#include <linux/delay.h>
++#include <linux/io.h>
++#include <linux/module.h>
++#include <linux/of.h>
++#include <linux/of_platform.h>
++#include <linux/platform_device.h>
++
++#define CRG53_GPU		0x00d4
++#define  GPU_CKEN		BIT(0)
++#define  GPU_SRST		BIT(4)
++#define  GPU_PP_CKEN		(BIT(8) | BIT(9) | BIT(10))
++
++#define CRG_GPU_FREQ		0x0124
++#define  GPU_FREQ_SEL		GENMASK(2, 0)
++#define  GPU_DIV_CFG		GENMASK(5, 4)
++#define  GPU_DIV_CFG_BYPASS	BIT(8)
++#define  GPU_BEGIN_CFG_BYPASS	BIT(9)
++#define PMC18_POWER_TIME	0x0048
++#define PMC21_GPU_FREQ		0x0054
++#define  GPU_PWR_GOOD_WAIT	GENMASK(15, 0)
++#define  GPU_USE_PWR_GOOD_CPU	BIT(16)
++#define  GPU_FREQ_TREND_UP	BIT(18)
++#define  GPU_FREQ_FSM_EN	BIT(20)
++#define  GPU_FREQ_REQ		BIT(21)
++#define PMC44_GPU_CTRL		0x00b0
++#define  GPU_PMU_CNT_BYPASS	BIT(0)
++#define  GPU_PMU_BYPASS		BIT(1)
++
++/*
++ * Fixed GPU clock. Changing it while a job runs hangs the PP (lima devfreq
++ * does exactly that), and a hung GPU does not recover until reboot, so no
++ * devfreq: pick the rate at boot. 345.6 MHz = vendor default.
++ */
++static unsigned int mhz = 345;
++module_param(mhz, uint, 0444);
++MODULE_PARM_DESC(mhz, "GPU core clock in MHz (200/250/300/345/375/400/432)");
++
++/* vendor mali4xx_clk.c table for hi3798mv100 (500 MHz entry exceeds MAX_FREQ 432) */
++static const struct { unsigned long rate; u32 sel; } gpu_rates[] = {
++	{ 200000000, 6 }, { 250000000, 5 }, { 300000000, 4 }, { 345600000, 3 },
++	{ 375000000, 2 }, { 400000000, 1 }, { 432000000, 0 },
++};
++
++struct hi3798mv100_gpu {
++	struct clk_hw hw;
++	void __iomem *crg, *pmc;
++};
++#define to_gpu(_hw) container_of(_hw, struct hi3798mv100_gpu, hw)
++
++static unsigned long gpu_clk_recalc(struct clk_hw *hw, unsigned long parent)
++{
++	u32 sel = readl(to_gpu(hw)->crg + CRG_GPU_FREQ) & GPU_FREQ_SEL;
++	int i;
++
++	for (i = 0; i < ARRAY_SIZE(gpu_rates); i++)
++		if (gpu_rates[i].sel == sel)
++			return gpu_rates[i].rate;
++	return 500000000;	/* sel 7 */
++}
++
++static int gpu_clk_idx(unsigned long rate)
++{
++	int i;
++
++	for (i = ARRAY_SIZE(gpu_rates) - 1; i > 0; i--)
++		if (gpu_rates[i].rate <= rate)
++			break;
++	return i;
++}
++
++static long gpu_clk_round(struct clk_hw *hw, unsigned long rate, unsigned long *parent)
++{
++	return gpu_rates[gpu_clk_idx(rate)].rate;
++}
++
++static int gpu_clk_set(struct clk_hw *hw, unsigned long rate, unsigned long parent)
++{
++	struct hi3798mv100_gpu *g = to_gpu(hw);
++	int i = gpu_clk_idx(rate);
++	u32 ctl = readl(g->pmc + PMC21_GPU_FREQ);
++	u32 v;
++
++	if (gpu_rates[i].rate > gpu_clk_recalc(hw, 0))
++		ctl |= GPU_FREQ_TREND_UP;
++	else
++		ctl &= ~GPU_FREQ_TREND_UP;
++	writel(ctl, g->pmc + PMC21_GPU_FREQ);
++
++	v = readl(g->crg + CRG_GPU_FREQ) & ~GPU_FREQ_SEL;
++	writel(v | gpu_rates[i].sel, g->crg + CRG_GPU_FREQ);
++
++	writel(ctl | GPU_FREQ_REQ, g->pmc + PMC21_GPU_FREQ);
++	writel(ctl & ~GPU_FREQ_REQ, g->pmc + PMC21_GPU_FREQ);
++	return 0;
++}
++
++static const struct clk_ops gpu_clk_ops = {
++	.recalc_rate = gpu_clk_recalc,
++	.round_rate = gpu_clk_round,
++	.set_rate = gpu_clk_set,
++};
++
++static int hi3798mv100_gpu_probe(struct platform_device *pdev)
++{
++	struct resource *res = platform_get_resource(pdev, IORESOURCE_MEM, 0);
++	struct resource *res_pmc = platform_get_resource(pdev, IORESOURCE_MEM, 1);
++	struct clk_init_data init = { .name = "gpu_core", .ops = &gpu_clk_ops };
++	struct hi3798mv100_gpu *g;
++	void __iomem *crg;
++	u32 v;
++	int ret;
++
++	g = devm_kzalloc(&pdev->dev, sizeof(*g), GFP_KERNEL);
++	if (!g)
++		return -ENOMEM;
++	if (!res || !res_pmc)
++		return -EINVAL;
++	crg = devm_ioremap(&pdev->dev, res->start, resource_size(res));
++	g->pmc = devm_ioremap(&pdev->dev, res_pmc->start, resource_size(res_pmc));
++	if (!crg || !g->pmc)
++		return -ENOMEM;
++	g->crg = crg;
++
++	v = readl(crg + CRG53_GPU) | GPU_CKEN | GPU_PP_CKEN;
++	writel(v | GPU_SRST, crg + CRG53_GPU);
++	udelay(10);
++	writel(v & ~GPU_SRST, crg + CRG53_GPU);
++	udelay(10);
++	/* vendor hisi_pmc_setparameter(): Mali PMU + power-good counter, HW freq FSM */
++	writel(readl(g->pmc + PMC44_GPU_CTRL) & ~(GPU_PMU_BYPASS | GPU_PMU_CNT_BYPASS),
++	       g->pmc + PMC44_GPU_CTRL);
++	v = readl(g->pmc + PMC21_GPU_FREQ);
++	v = (v | GPU_FREQ_FSM_EN) & ~(GPU_PWR_GOOD_WAIT | GPU_USE_PWR_GOOD_CPU);
++	writel(v | 0x2fff, g->pmc + PMC21_GPU_FREQ);
++	writel(0x00ffff88, g->pmc + PMC18_POWER_TIME);
++	v = readl(crg + CRG_GPU_FREQ);
++	v &= ~(GPU_BEGIN_CFG_BYPASS | GPU_DIV_CFG_BYPASS | GPU_DIV_CFG);
++	writel(v | GPU_FREQ_SEL, crg + CRG_GPU_FREQ);
++	gpu_clk_set(&g->hw, mhz == 345 ? 345600000UL : mhz * 1000000UL, 0);
++
++	g->hw.init = &init;
++	ret = devm_clk_hw_register(&pdev->dev, &g->hw);
++	if (ret)
++		return ret;
++	ret = devm_of_clk_add_hw_provider(&pdev->dev, of_clk_hw_simple_get, &g->hw);
++	if (ret)
++		return ret;
++
++	dev_info(&pdev->dev, "GPU clocks on, CRG53 %08x, core %lu Hz\n",
++		 readl(crg + CRG53_GPU), gpu_clk_recalc(&g->hw, 0));
++
++	return devm_of_platform_populate(&pdev->dev);
++}
++
++static const struct of_device_id hi3798mv100_gpu_of_match[] = {
++	{ .compatible = "hisilicon,hi3798mv100-gpu-glue" },
++	{ }
++};
++MODULE_DEVICE_TABLE(of, hi3798mv100_gpu_of_match);
++
++static struct platform_driver hi3798mv100_gpu_driver = {
++	.probe = hi3798mv100_gpu_probe,
++	.driver = {
++		.name = "hi3798mv100-gpu",
++		.of_match_table = hi3798mv100_gpu_of_match,
++	},
++};
++module_platform_driver(hi3798mv100_gpu_driver);
++
++MODULE_DESCRIPTION("Hi3798MV100 GPU glue");
++MODULE_LICENSE("GPL");

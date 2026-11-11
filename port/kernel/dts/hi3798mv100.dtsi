@@ -1,0 +1,525 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
+/*
+ * HiSilicon Hi3798Mv100 SoC device tree source
+ *
+ * Based on reverse engineering from vendor kernel 3.10.0_s40
+ * Machine: "bigfish" (HiSTBAndroidV600R001C00SPC062)
+ */
+
+#include <dt-bindings/interrupt-controller/arm-gic.h>
+#include <dt-bindings/thermal/thermal.h>
+#include <dt-bindings/clock/histb-clock.h>
+
+/ {
+	#address-cells = <1>;
+	#size-cells = <1>;
+
+	interrupt-parent = <&gic>;
+
+	cpus {
+		#address-cells = <1>;
+		#size-cells = <0>;
+
+		cpu0: cpu@0 {
+			device_type = "cpu";
+			compatible = "arm,cortex-a7";
+			reg = <0x0>;
+			enable-method = "hisilicon,hi3798mv100-smp";
+			#cooling-cells = <2>;
+		};
+
+		cpu@1 {
+			device_type = "cpu";
+			compatible = "arm,cortex-a7";
+			reg = <0x1>;
+			enable-method = "hisilicon,hi3798mv100-smp";
+		};
+
+		cpu@2 {
+			device_type = "cpu";
+			compatible = "arm,cortex-a7";
+			reg = <0x2>;
+			enable-method = "hisilicon,hi3798mv100-smp";
+		};
+
+		cpu@3 {
+			device_type = "cpu";
+			compatible = "arm,cortex-a7";
+			reg = <0x3>;
+			enable-method = "hisilicon,hi3798mv100-smp";
+		};
+	};
+
+	/*
+	 * Verified from U-Boot (b31): GICD_IIDR=0x0100143b, TYPER=0xfc65 (192 IRQs, 4 CPUs),
+	 * ITARGETSR=0x01010101; GICC_IIDR=0x0102143b. Old 0x10301000 was plain DRAM.
+	 */
+	gic: interrupt-controller@f8a01000 {
+		compatible = "arm,cortex-a7-gic";
+		#interrupt-cells = <3>;
+		#address-cells = <0>;
+		interrupt-controller;
+		reg = <0xf8a01000 0x1000>, <0xf8a02000 0x2000>;
+	};
+
+	timer {
+		compatible = "arm,armv7-timer";
+		/* CNTVCT reads garbage; vendor kernel uses SP804 instead */
+		status = "disabled";
+		interrupts = <GIC_PPI 13 (GIC_CPU_MASK_SIMPLE(4) | IRQ_TYPE_LEVEL_LOW)>,
+			     <GIC_PPI 14 (GIC_CPU_MASK_SIMPLE(4) | IRQ_TYPE_LEVEL_LOW)>,
+			     <GIC_PPI 11 (GIC_CPU_MASK_SIMPLE(4) | IRQ_TYPE_LEVEL_LOW)>,
+			     <GIC_PPI 10 (GIC_CPU_MASK_SIMPLE(4) | IRQ_TYPE_LEVEL_LOW)>;
+		clock-frequency = <24000000>;
+	};
+
+	pmu {
+		compatible = "arm,cortex-a7-pmu";
+		/* IRQ unknown (old value was TDE's line) */
+		status = "disabled";
+	};
+
+	clk_24m: clk_24m {
+		compatible = "fixed-clock";
+		#clock-cells = <0>;
+		clock-frequency = <24000000>;
+	};
+
+	clk_25m: clk_25m {
+		compatible = "fixed-clock";
+		#clock-cells = <0>;
+		clock-frequency = <25000000>;
+	};
+
+	clk_50m: clk_50m {
+		compatible = "fixed-clock";
+		#clock-cells = <0>;
+		clock-frequency = <50000000>;
+	};
+
+	clk_100m: clk_100m {
+		compatible = "fixed-clock";
+		#clock-cells = <0>;
+		clock-frequency = <100000000>;
+	};
+
+	clk_200m: clk_200m {
+		compatible = "fixed-clock";
+		#clock-cells = <0>;
+		clock-frequency = <200000000>;
+	};
+
+	clk_125m: clk_125m {
+		compatible = "fixed-clock";
+		#clock-cells = <0>;
+		clock-frequency = <125000000>;
+	};
+
+	clk_uart0: clk_uart0 {
+		compatible = "fixed-clock";
+		#clock-cells = <0>;
+		/* Actual UART0 hardware clock ~83.3 MHz (measured via IBRD=45 FBRD=12 at 115200) */
+		clock-frequency = <83289600>;
+	};
+
+	clk_timer: clk_timer {
+		compatible = "fixed-clock";
+		#clock-cells = <0>;
+		clock-frequency = <24000000>;
+	};
+
+	/*
+	 * CPU clock switch (CRG+0x48) and per-core resets (CRG+0x50) used by the
+	 * hi3798mv100 SMP ops; secondaries enter via a trampoline at 0xffff0000.
+	 */
+	cpuctrl: cpu-controller@f8a22048 {
+		compatible = "hisilicon,hi3798mv100-cpuctrl";
+		reg = <0xf8a22048 0x10>;
+		/* boot at 800 MHz; hi3798mv100-cpufreq then switches 800/1200 MHz under thermal control */
+		hisilicon,cpu-clk-sel = <1>;
+	};
+
+	/* T-sensor (PMC10/12/13), decoded from the stock kernel's mpu_get_temperature */
+	tsensor: thermal-sensor@f8a23028 {
+		compatible = "hisilicon,hi3798mv100-tsensor";
+		reg = <0xf8a23028 0x10>;
+		#thermal-sensor-cells = <0>;
+	};
+
+	/*
+	 * Stock cooling at 1.2 GHz x4: 84 C after 5 min, memory-heavy load hangs ~90 C.
+	 * 800 MHz holds. Throttle to 800 MHz at 75 C, orderly shutdown at 95 C.
+	 */
+	thermal-zones {
+		cpu_thermal: cpu-thermal {
+			polling-delay-passive = <1000>;
+			polling-delay = <2000>;
+			thermal-sensors = <&tsensor>;
+
+			trips {
+				cpu_alert: cpu-alert {
+					temperature = <75000>;
+					hysteresis = <5000>;
+					type = "passive";
+				};
+				cpu_crit: cpu-crit {
+					temperature = <95000>;
+					hysteresis = <2000>;
+					type = "critical";
+				};
+			};
+
+			cooling-maps {
+				map0 {
+					trip = <&cpu_alert>;
+					cooling-device = <&cpu0 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>;
+				};
+				map1 {
+					trip = <&cpu_alert>;
+					cooling-device = <&mali THERMAL_NO_LIMIT THERMAL_NO_LIMIT>;
+				};
+			};
+		};
+	};
+
+	/* System controller; SC_SYSRES at +0x4 (write 0xdeadbeef = reset), as on Hi3798CV200 */
+	sysctrl: system-controller@f8000000 {
+		compatible = "syscon";
+		reg = <0xf8000000 0x1000>;
+	};
+
+	reboot {
+		compatible = "syscon-reboot";
+		regmap = <&sysctrl>;
+		offset = <0x4>;
+		value = <0xdeadbeef>;
+	};
+
+	soc {
+		#address-cells = <1>;
+		#size-cells = <1>;
+		compatible = "simple-bus";
+		ranges;
+
+		uart0_clk: uart0_clk {
+			compatible = "fixed-clock";
+			#clock-cells = <0>;
+			clock-frequency = <24000000>;
+		};
+
+		uart0: serial@f8b00000 {
+			compatible = "arm,pl011", "arm,primecell";
+			reg = <0xf8b00000 0x1000>;
+			arm,primecell-periphid = <0x00041011>;
+			interrupts = <GIC_SPI 49 IRQ_TYPE_LEVEL_HIGH>;
+			clocks = <&clk_uart0>, <&clk_100m>;
+			clock-names = "uartclk", "apb_pclk";
+			reg-io-width = <4>;
+			status = "disabled";
+		};
+
+		uart1: serial@f8006000 {
+			compatible = "arm,pl011", "arm,primecell";
+			reg = <0xf8006000 0x1000>;
+			arm,primecell-periphid = <0x00041011>;
+			interrupts = <GIC_SPI 50 IRQ_TYPE_LEVEL_HIGH>;
+			clocks = <&clk_24m>, <&clk_100m>;
+			clock-names = "uartclk", "apb_pclk";
+			status = "disabled";
+		};
+
+		uart2: serial@f8b02000 {
+			compatible = "arm,pl011", "arm,primecell";
+			reg = <0xf8b02000 0x1000>;
+			arm,primecell-periphid = <0x00041011>;
+			interrupts = <GIC_SPI 51 IRQ_TYPE_LEVEL_HIGH>;
+			clocks = <&clk_uart0>, <&clk_100m>;
+			clock-names = "uartclk", "apb_pclk";
+			status = "disabled";
+		};
+
+		/*
+		 * eMMC = hi_mci.1 @ f9830000, GIC 67 (SPI 35) -- confirmed by vendor /proc/interrupts.
+		 * CRG 0xa0 (PERI_CRG40) = 0x00040103 set by U-Boot: clk_sel[9:8]=01 -> ciu 100 MHz
+		 * (fastboot SDIO1_CLK_SEL_100M, MMC_CLK 100000000), drive phase [18:16]=180 deg,
+		 * sample phase [14:12]=0 deg -- same values the stock kernel uses for DDR52.
+		 * Before b44 the ciu was wrongly described as 50 MHz, so every card clock was 2x the
+		 * requested one (the b31 "HS 50 MHz" CRC errors were really 100 MHz).
+		 */
+		mmc0: mmc@f9830000 {
+			compatible = "snps,dw-mshc";
+			reg = <0xf9830000 0x1000>;
+			interrupts = <GIC_SPI 35 IRQ_TYPE_LEVEL_HIGH>;
+			clocks = <&clk_100m>, <&clk_100m>;
+			clock-names = "biu", "ciu";
+			fifo-depth = <256>;
+			max-frequency = <50000000>;
+			cap-mmc-highspeed;
+			mmc-ddr-3_3v;
+			bus-width = <8>;
+			non-removable;
+			disable-wp;
+			status = "disabled";
+		};
+
+		/* SD slot = hi_mci.0 @ f9820000, GIC 66 (SPI 34). CRG 0x9c = 0x203, mux[9:8]=2 -> ciu 50 MHz.
+		 * Native CDETECT works (vendor himciv200 uses it); I/O LDO 0xf8a2011c left as U-Boot set it. */
+		mmc1: mmc@f9820000 {
+			compatible = "snps,dw-mshc";
+			reg = <0xf9820000 0x1000>;
+			interrupts = <GIC_SPI 34 IRQ_TYPE_LEVEL_HIGH>;
+			clocks = <&clk_100m>, <&clk_50m>;
+			clock-names = "biu", "ciu";
+			fifo-depth = <256>;
+			bus-width = <4>;
+			max-frequency = <50000000>;
+			cap-sd-highspeed;
+			disable-wp;
+			post-power-on-delay-ms = <200>; /* vendor himciv200 waits 100 ms after PWREN */
+			status = "disabled";
+		};
+
+		/*
+		 * hieth-sf (SDK "hieth", sfv300) @ f9840000 = same IP as mainline hisi-femac:
+		 * up-port regs @ +0x0000, MDIO @ +0x1100, GLB @ +0x1300 (down port @ +0x2000 unused).
+		 * Vendor IRQ GIC 103 -> SPI 71. Internal FE PHY (FESTA) at MDIO addr 1; U-Boot
+		 * initialises PHY clock/reset/address/fixups on every boot (CRG 0xf8a22000 + 0x388).
+		 */
+		mdio0: mdio@f9841100 {
+			compatible = "hisilicon,hisi-femac-mdio";
+			reg = <0xf9841100 0x10>;
+			clocks = <&clk_50m>;
+			#address-cells = <1>;
+			#size-cells = <0>;
+			status = "disabled";
+
+			fephy: ethernet-phy@1 {
+				reg = <1>;
+			};
+		};
+
+		femac: ethernet@f9840000 {
+			compatible = "hisilicon,hisi-femac-v1";
+			reg = <0xf9840000 0x1000>, <0xf9841300 0x200>;
+			interrupts = <GIC_SPI 71 IRQ_TYPE_LEVEL_HIGH>;
+			clocks = <&clk_50m>;
+			phy-handle = <&fephy>;
+			phy-mode = "mii";
+			status = "disabled";
+		};
+
+		/*
+		 * USB2 host PHYs: not memory mapped. Clock/reset in CRG (f8a22000 +0xb8/0xbc,
+		 * +0x190/0x198), INNO PHY test bus in PERI_CTRL (f8a20000 +0x124/+0x158).
+		 * U-Boot "usb stop" leaves all of it in reset. Cell 0 = host0, 1 = host1.
+		 */
+		usb2_phy: usb-phy@f8a22000 {
+			compatible = "hisilicon,hi3798mv100-usb2-host-phy";
+			reg = <0xf8a22000 0x1000>, <0xf8a20000 0x1000>;
+			#phy-cells = <1>;
+		};
+
+		ehci0: usb@f9890000 {
+			compatible = "generic-ehci";
+			reg = <0xf9890000 0x10000>;
+			interrupts = <GIC_SPI 66 IRQ_TYPE_LEVEL_HIGH>;
+			phys = <&usb2_phy 0>;
+			phy-names = "usb";
+			status = "disabled";
+		};
+
+		ohci0: usb@f9880000 {
+			compatible = "generic-ohci";
+			reg = <0xf9880000 0x10000>;
+			interrupts = <GIC_SPI 67 IRQ_TYPE_LEVEL_HIGH>;
+			phys = <&usb2_phy 0>;
+			phy-names = "usb";
+			status = "disabled";
+		};
+
+		ehci1: usb@f9930000 {
+			compatible = "generic-ehci";
+			reg = <0xf9930000 0x10000>;
+			interrupts = <GIC_SPI 62 IRQ_TYPE_LEVEL_HIGH>;
+			phys = <&usb2_phy 1>;
+			phy-names = "usb";
+			status = "disabled";
+		};
+
+		ohci1: usb@f9920000 {
+			compatible = "generic-ohci";
+			reg = <0xf9920000 0x10000>;
+			interrupts = <GIC_SPI 63 IRQ_TYPE_LEVEL_HIGH>;
+			phys = <&usb2_phy 1>;
+			phy-names = "usb";
+			status = "disabled";
+		};
+
+		/*
+		 * USB3: DWC3 core run as plain xHCI (stock kernel: hiusb-xhci, io f98a0000, GIC 101).
+		 * Glue replays the vendor clk-hiusb3.c sequence (CRG44 +0xb0, CRG101 +0x194, PERI_CTRL).
+		 */
+		usb3: usb3-glue@f98a0000 {
+			compatible = "hisilicon,hi3798mv100-usb3";
+			reg = <0xf98a0000 0x10000>, <0xf8a22000 0x1000>, <0xf8a20000 0x1000>;
+			#address-cells = <1>;
+			#size-cells = <1>;
+			ranges;
+			status = "disabled";
+
+			xhci: usb@f98a0000 {
+				compatible = "generic-xhci";
+				reg = <0xf98a0000 0x10000>;
+				interrupts = <GIC_SPI 69 IRQ_TYPE_LEVEL_HIGH>;
+			};
+		};
+
+		usb_otg: usb@f98c0000 {
+			compatible = "snps,dwc2";
+			reg = <0xf98c0000 0x40000>;
+			interrupts = <GIC_SPI 68 IRQ_TYPE_LEVEL_HIGH>;
+			clocks = <&clk_100m>;
+			clock-names = "otg";
+			dr_mode = "otg";
+			g-np-tx-fifo-size = <16>;
+			g-rx-fifo-size = <256>;
+			g-tx-fifo-size = <128 128 64>;
+			status = "disabled";
+		};
+
+
+
+		/*
+		 * Mali-450 MP2 (GP + 2 PP, PMU, broadcast), all IRQs on GIC 126 = SPI 94 (vendor
+		 * mali4xx platform). Glue enables CRG53 (+0xd4) clocks, pulses the GPU reset, runs the
+		 * vendor PMC setup and fixes the core clock (default 345.6 MHz, no devfreq: switching
+		 * the clock while a job runs hangs the GPU until reboot).
+		 */
+		gpu_glue: gpu-glue@f8a22000 {
+			compatible = "hisilicon,hi3798mv100-gpu-glue";
+			reg = <0xf8a22000 0x1000>, <0xf8a23000 0x1000>;
+			#clock-cells = <0>;
+			#address-cells = <1>;
+			#size-cells = <1>;
+			ranges;
+			status = "disabled";
+
+			mali: gpu@f9200000 {
+				compatible = "hisilicon,hi3798mv100-mali", "arm,mali-450";
+				reg = <0xf9200000 0x30000>;
+				interrupts = <GIC_SPI 94 IRQ_TYPE_LEVEL_HIGH>,
+					     <GIC_SPI 94 IRQ_TYPE_LEVEL_HIGH>,
+					     <GIC_SPI 94 IRQ_TYPE_LEVEL_HIGH>,
+					     <GIC_SPI 94 IRQ_TYPE_LEVEL_HIGH>,
+					     <GIC_SPI 94 IRQ_TYPE_LEVEL_HIGH>,
+					     <GIC_SPI 94 IRQ_TYPE_LEVEL_HIGH>,
+					     <GIC_SPI 94 IRQ_TYPE_LEVEL_HIGH>,
+					     <GIC_SPI 94 IRQ_TYPE_LEVEL_HIGH>;
+				interrupt-names = "gp", "gpmmu", "pp0", "ppmmu0", "pp1", "ppmmu1", "pp", "pmu";
+				clocks = <&clk_200m>, <&gpu_glue>;
+				clock-names = "bus", "core";
+				operating-points-v2 = <&gpu_opp_table>;
+				#cooling-cells = <2>;
+			};
+		};
+
+		gpu_opp_table: opp-table-gpu {
+			compatible = "operating-points-v2";
+
+			opp-200000000 { opp-hz = /bits/ 64 <200000000>; };
+			opp-250000000 { opp-hz = /bits/ 64 <250000000>; };
+			opp-300000000 { opp-hz = /bits/ 64 <300000000>; };
+			opp-345600000 { opp-hz = /bits/ 64 <345600000>; };
+			opp-375000000 { opp-hz = /bits/ 64 <375000000>; };
+			opp-400000000 { opp-hz = /bits/ 64 <400000000>; };
+			opp-432000000 { opp-hz = /bits/ 64 <432000000>; };
+		};
+
+		i2c0: i2c@f8b10000 {
+			#address-cells = <1>;
+			#size-cells = <0>;
+			compatible = "snps,designware-i2c";
+			reg = <0xf8b10000 0x1000>;
+			interrupts = <GIC_SPI 38 IRQ_TYPE_LEVEL_HIGH>;
+			clocks = <&clk_100m>;
+			clock-names = "pclk";
+			status = "disabled";
+		};
+
+		i2c1: i2c@f8b11000 {
+			#address-cells = <1>;
+			#size-cells = <0>;
+			compatible = "snps,designware-i2c";
+			reg = <0xf8b11000 0x1000>;
+			interrupts = <GIC_SPI 39 IRQ_TYPE_LEVEL_HIGH>;
+			clocks = <&clk_100m>;
+			clock-names = "pclk";
+			status = "disabled";
+		};
+
+		i2c2: i2c@f8b12000 {
+			#address-cells = <1>;
+			#size-cells = <0>;
+			compatible = "snps,designware-i2c";
+			reg = <0xf8b12000 0x1000>;
+			interrupts = <GIC_SPI 40 IRQ_TYPE_LEVEL_HIGH>;
+			clocks = <&clk_100m>;
+			clock-names = "pclk";
+			status = "disabled";
+		};
+
+		/*
+		 * IR receiver (vendor SDK DTS ir@f8001000, GIC 79). Clock gate/reset in
+		 * SC_CLKGATE_SRST_CTRL (SC+0x48) bit 4 en / bit 5 rst, 24 MHz (vendor clk-hiir.c);
+		 * ir-hix5hd2 drives that via the sysctrl regmap (socdata clk_reg 0x48).
+		 */
+		ir: ir@f8001000 {
+			compatible = "hisilicon,hix5hd2-ir";
+			reg = <0xf8001000 0x1000>;
+			interrupts = <GIC_SPI 47 IRQ_TYPE_LEVEL_HIGH>;
+			clocks = <&clk_24m>;
+			hisilicon,power-syscon = <&sysctrl>;
+			status = "disabled";
+		};
+
+		/*
+		 * TRNG (vendor SDK msp/drv/cipher, MV100 = old layout: CTRL +0, NUMBER +4,
+		 * STAT +8 count[2:0]); no clock gate. Same IP/address as Hi3798CV200.
+		 */
+		rng: rng@f8005000 {
+			compatible = "hisilicon,histb-rng";
+			reg = <0xf8005000 0x100>;
+		};
+
+		/*
+		 * SP805 watchdog (vendor WDG0). Verified: a second expiry hard-resets the
+		 * SoC (back to Fastboot). PrimeCell ID regs read 0. WDG1 @ f8a2d000 unused.
+		 */
+		watchdog: watchdog@f8a2c000 {
+			compatible = "arm,sp805", "arm,primecell";
+			arm,primecell-periphid = <0x00141805>;
+			reg = <0xf8a2c000 0x1000>;
+			clocks = <&clk_24m>, <&clk_24m>;
+			clock-names = "wdog_clk", "apb_pclk";
+			timeout-sec = <30>;
+		};
+
+		/*
+		 * SP804 timers as used by the vendor kernel: timer2 (f8a29000) is the
+		 * clocksource, timer4..7 are per-CPU local timers with one SPI each
+		 * (vendor GIC 58/91/59/92). 24 MHz. PrimeCell ID regs read 0.
+		 */
+		timer: timer@f8a29000 {
+			compatible = "hisilicon,hi3798mv100-timer";
+			reg = <0xf8a29000 0x20>,
+			      <0xf8a2a000 0x20>, <0xf8a2a020 0x20>,
+			      <0xf8a2b000 0x20>, <0xf8a2b020 0x20>;
+			interrupts = <GIC_SPI 26 IRQ_TYPE_LEVEL_HIGH>,
+				     <GIC_SPI 59 IRQ_TYPE_LEVEL_HIGH>,
+				     <GIC_SPI 27 IRQ_TYPE_LEVEL_HIGH>,
+				     <GIC_SPI 60 IRQ_TYPE_LEVEL_HIGH>;
+			clocks = <&clk_timer>;
+		};
+
+	};
+};

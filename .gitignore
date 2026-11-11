@@ -1,0 +1,34 @@
+# Whitelist at top level: only these folders/files are part of the repo.
+# Everything else here (eMMC dump, build checkpoints bXX/, per-build patches, vendor SDK clone,
+# tftp/ runtime dir, Alpine build dirs, firmware blobs, private notes) stays local.
+/*
+!/.gitignore
+!/README.md
+!/docs/
+!/images/
+!/hardware/
+!/bootloader/
+!/port/
+!/extras/
+
+# local agent notes: session handoffs (never committed)
+handoff-*.md
+/docs/handoffs/
+
+# Never commit binaries, images, builds, or manual snapshot copies.
+*.img
+*.bin
+*.dtb
+*.raw
+*.cpio
+*.cpio.gz
+*.tar.gz
+*.ext4
+*.log
+*.orig
+*.pyc
+__pycache__/
+zImage*
+uImage*
+# on-board tool built with gcc on the box (binary)
+/port/board/devmem

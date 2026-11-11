@@ -1,0 +1,6 @@
+#!/bin/sh
+# Hi3798MV100 T-sensor (from vendor 3.10 mpu_get_temperature): enable via PMC10, 8 byte samples in PMC12/13
+devmem 0xf8a23028 0x07200000 >/dev/null
+a=$(devmem 0xf8a23030); b=$(devmem 0xf8a23034); s=0
+for v in $a $b; do for sh in 0 8 16 24; do s=$(( s + ((v >> sh) & 0xff) )); done; done
+echo $(( (s/8) * 180 / 255 - 40 ))
